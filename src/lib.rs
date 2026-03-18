@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use schemars::JsonSchema;
@@ -52,14 +53,24 @@ struct WorktreeContextServerEntry {
 }
 
 struct CodexCompanionExtension {
-    cached_server_path: Option<String>,
-    cached_server_env: Vec<(String, String)>,
-    cached_release_repo: Option<String>,
+    state: Mutex<ExtensionState>,
 }
 
 #[derive(Debug, Clone)]
 struct ServerPathCandidate {
     path: PathBuf,
+}
+
+#[derive(Debug, Default)]
+struct ExtensionState {
+    cached_launch: Option<CachedLaunchConfig>,
+    cached_project_settings: Option<CodexCompanionSettings>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedLaunchConfig {
+    settings_key: String,
+    launch: ResolvedLaunchConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -99,36 +110,80 @@ impl CodexCompanionExtension {
         None
     }
 
+    fn cache_project_settings(&self, settings: CodexCompanionSettings) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Codex Companion extension state lock poisoned".to_string())?;
+        state.cached_project_settings = Some(settings);
+        Ok(())
+    }
+
+    fn cached_project_settings(&self) -> Option<CodexCompanionSettings> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.cached_project_settings.clone())
+    }
+
+    fn merged_slash_settings(&self, worktree: &Worktree) -> CodexCompanionSettings {
+        merge_settings(
+            self.cached_project_settings(),
+            self.load_worktree_settings(worktree),
+        )
+    }
+
+    fn cache_launch_config(
+        &self,
+        settings_key: String,
+        launch: ResolvedLaunchConfig,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Codex Companion extension state lock poisoned".to_string())?;
+        state.cached_launch = Some(CachedLaunchConfig {
+            settings_key,
+            launch,
+        });
+        Ok(())
+    }
+
+    fn cached_launch_config(&self, settings_key: &str) -> Option<ResolvedLaunchConfig> {
+        self.state.lock().ok().and_then(|state| {
+            state.cached_launch.as_ref().and_then(|cached| {
+                if cached.settings_key == settings_key
+                    && fs::metadata(&cached.launch.server_path)
+                        .is_ok_and(|metadata| metadata.is_file())
+                {
+                    Some(cached.launch.clone())
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
     fn resolve_server_path(
-        &mut self,
+        &self,
         server_path: Option<String>,
         release_repo: Option<String>,
     ) -> Result<String> {
-        if let Some(path) = &self.cached_server_path {
-            if fs::metadata(path).is_ok_and(|metadata| metadata.is_file()) {
-                return Ok(path.clone());
-            }
-        }
+        let repo = normalize_non_empty(release_repo)
+            .or_else(|| normalize_non_empty(env::var("CODEX_COMPANION_RELEASE_REPO").ok()))
+            .or_else(default_release_repo);
 
         let mut searched_paths = Vec::new();
         for candidate in self.server_path_candidates(server_path) {
             let display = candidate.path.display().to_string();
             searched_paths.push(display.clone());
             if fs::metadata(&candidate.path).is_ok_and(|metadata| metadata.is_file()) {
-                let path = candidate.path.to_string_lossy().to_string();
-                self.cached_server_path = Some(path.clone());
-                return Ok(path);
+                return Ok(candidate.path.to_string_lossy().to_string());
             }
         }
 
-        let repo = normalize_non_empty(release_repo)
-            .or_else(|| normalize_non_empty(env::var("CODEX_COMPANION_RELEASE_REPO").ok()))
-            .or_else(default_release_repo);
-
         if let Some(repo) = repo {
-            let downloaded = self.download_server_from_release(&repo)?;
-            self.cached_server_path = Some(downloaded.clone());
-            return Ok(downloaded);
+            return self.download_server_from_release(&repo);
         }
 
         Err(format!(
@@ -400,47 +455,40 @@ impl CodexCompanionExtension {
     }
 
     fn resolve_launch_config(
-        &mut self,
-        settings: Option<&CodexCompanionSettings>,
+        &self,
+        settings: &CodexCompanionSettings,
     ) -> Result<ResolvedLaunchConfig> {
-        let (server_env, explicit_server_path, release_repo) = match settings {
-            Some(settings) => (
-                self.server_env(settings),
-                settings
-                    .server_path
-                    .clone()
-                    .or_else(|| env::var("CODEX_COMPANION_SERVER_PATH").ok()),
-                normalize_non_empty(settings.release_repo.clone())
-                    .or_else(|| normalize_non_empty(env::var("CODEX_COMPANION_RELEASE_REPO").ok())),
-            ),
-            None => (
-                self.cached_server_env.clone(),
-                self.cached_env("CODEX_COMPANION_SERVER_PATH")
-                    .or_else(|| env::var("CODEX_COMPANION_SERVER_PATH").ok()),
-                self.cached_release_repo.clone().or_else(|| {
-                    self.cached_env("CODEX_COMPANION_RELEASE_REPO").or_else(|| {
-                        normalize_non_empty(env::var("CODEX_COMPANION_RELEASE_REPO").ok())
-                    })
-                }),
-            ),
-        };
-        let server_path = self.resolve_server_path(explicit_server_path, release_repo.clone())?;
+        let server_env = self.server_env(settings);
+        let explicit_server_path = settings
+            .server_path
+            .clone()
+            .or_else(|| env::var("CODEX_COMPANION_SERVER_PATH").ok());
+        let release_repo = normalize_non_empty(settings.release_repo.clone())
+            .or_else(|| normalize_non_empty(env::var("CODEX_COMPANION_RELEASE_REPO").ok()))
+            .or_else(default_release_repo);
+        let settings_key = launch_settings_key(
+            &server_env,
+            explicit_server_path.as_deref(),
+            release_repo.as_deref(),
+        );
 
-        if settings.is_some() {
-            self.cached_server_env = server_env.clone();
-            self.cached_release_repo = release_repo;
+        if let Some(cached) = self.cached_launch_config(&settings_key) {
+            return Ok(cached);
         }
 
-        Ok(ResolvedLaunchConfig {
+        let server_path = self.resolve_server_path(explicit_server_path, release_repo.clone())?;
+        let launch = ResolvedLaunchConfig {
             server_path,
             server_env,
-        })
+        };
+        self.cache_launch_config(settings_key, launch.clone())?;
+        Ok(launch)
     }
 
     fn run_cli(
-        &mut self,
+        &self,
         cli_args: &[String],
-        settings: Option<&CodexCompanionSettings>,
+        settings: &CodexCompanionSettings,
     ) -> std::result::Result<String, String> {
         let launch = self.resolve_launch_config(settings)?;
         let mut command = ProcessCommand::new(launch.server_path).envs(launch.server_env);
@@ -467,21 +515,12 @@ impl CodexCompanionExtension {
             text,
         }
     }
-
-    fn cached_env(&self, key: &str) -> Option<String> {
-        self.cached_server_env
-            .iter()
-            .rev()
-            .find_map(|(candidate, value)| (candidate == key).then(|| value.clone()))
-    }
 }
 
 impl zed::Extension for CodexCompanionExtension {
     fn new() -> Self {
         Self {
-            cached_server_path: None,
-            cached_server_env: Vec::new(),
-            cached_release_repo: None,
+            state: Mutex::new(ExtensionState::default()),
         }
     }
 
@@ -491,7 +530,8 @@ impl zed::Extension for CodexCompanionExtension {
         project: &Project,
     ) -> Result<Command> {
         let settings = self.load_settings(project)?;
-        let launch = self.resolve_launch_config(Some(&settings))?;
+        self.cache_project_settings(settings.clone())?;
+        let launch = self.resolve_launch_config(&settings)?;
 
         Ok(Command {
             command: launch.server_path,
@@ -503,8 +543,11 @@ impl zed::Extension for CodexCompanionExtension {
     fn context_server_configuration(
         &mut self,
         _context_server_id: &ContextServerId,
-        _project: &Project,
+        project: &Project,
     ) -> Result<Option<ContextServerConfiguration>> {
+        if let Ok(settings) = self.load_settings(project) {
+            let _ = self.cache_project_settings(settings);
+        }
         let installation_instructions =
             include_str!("../configuration/installation_instructions.md").to_string();
         let default_settings = include_str!("../configuration/default_settings.jsonc").to_string();
@@ -527,13 +570,8 @@ impl zed::Extension for CodexCompanionExtension {
         let worktree = worktree.ok_or_else(|| {
             "Codex Companion slash commands require a project worktree.".to_string()
         })?;
-        let worktree_settings = self.load_worktree_settings(worktree);
+        let effective_settings = self.merged_slash_settings(worktree);
         let root = worktree.root_path();
-        let mut extension = CodexCompanionExtension {
-            cached_server_path: self.cached_server_path.clone(),
-            cached_server_env: self.cached_server_env.clone(),
-            cached_release_repo: self.cached_release_repo.clone(),
-        };
 
         match command.name.as_str() {
             "codex-context" => {
@@ -541,7 +579,7 @@ impl zed::Extension for CodexCompanionExtension {
                     return Err("`/codex-context` requires a task or query.".to_string());
                 }
                 let query = args.join(" ");
-                let text = extension.run_cli(
+                let text = self.run_cli(
                     &[
                         "bundle".to_string(),
                         "--root".to_string(),
@@ -549,9 +587,9 @@ impl zed::Extension for CodexCompanionExtension {
                         "--query".to_string(),
                         query,
                     ],
-                    worktree_settings.as_ref(),
+                    &effective_settings,
                 )?;
-                Ok(extension.slash_output("Codex Context", text))
+                Ok(self.slash_output("Codex Context", text))
             }
             "codex-memory" => {
                 let mut cli_args = vec!["memory".to_string(), "--root".to_string(), root.clone()];
@@ -559,36 +597,36 @@ impl zed::Extension for CodexCompanionExtension {
                     cli_args.push("--query".to_string());
                     cli_args.push(args.join(" "));
                 }
-                let text = extension.run_cli(&cli_args, worktree_settings.as_ref())?;
-                Ok(extension.slash_output("Codex Memory", text))
+                let text = self.run_cli(&cli_args, &effective_settings)?;
+                Ok(self.slash_output("Codex Memory", text))
             }
             "codex-cache" => {
-                let text = extension.run_cli(
+                let text = self.run_cli(
                     &["status".to_string(), "--root".to_string(), root.clone()],
-                    worktree_settings.as_ref(),
+                    &effective_settings,
                 )?;
-                Ok(extension.slash_output("Codex Cache", text))
+                Ok(self.slash_output("Codex Cache", text))
             }
             "codex-refresh" => {
-                let text = extension.run_cli(
+                let text = self.run_cli(
                     &["index".to_string(), "--root".to_string(), root],
-                    worktree_settings.as_ref(),
+                    &effective_settings,
                 )?;
-                Ok(extension.slash_output("Codex Refresh", text))
+                Ok(self.slash_output("Codex Refresh", text))
             }
             "codex-warm" => {
-                let text = extension.run_cli(
+                let text = self.run_cli(
                     &["warm".to_string(), "--root".to_string(), root],
-                    worktree_settings.as_ref(),
+                    &effective_settings,
                 )?;
-                Ok(extension.slash_output("Codex Warmup", text))
+                Ok(self.slash_output("Codex Warmup", text))
             }
             "codex-plan" => {
                 if args.is_empty() {
                     return Err("`/codex-plan` requires a task or query.".to_string());
                 }
                 let query = args.join(" ");
-                let text = extension.run_cli(
+                let text = self.run_cli(
                     &[
                         "plan".to_string(),
                         "--root".to_string(),
@@ -596,16 +634,16 @@ impl zed::Extension for CodexCompanionExtension {
                         "--query".to_string(),
                         query,
                     ],
-                    worktree_settings.as_ref(),
+                    &effective_settings,
                 )?;
-                Ok(extension.slash_output("Codex Plan", text))
+                Ok(self.slash_output("Codex Plan", text))
             }
             "codex-orchestrate" => {
                 if args.is_empty() {
                     return Err("`/codex-orchestrate` requires a task or query.".to_string());
                 }
                 let query = args.join(" ");
-                let text = extension.run_cli(
+                let text = self.run_cli(
                     &[
                         "orchestrate".to_string(),
                         "--root".to_string(),
@@ -613,9 +651,9 @@ impl zed::Extension for CodexCompanionExtension {
                         "--query".to_string(),
                         query,
                     ],
-                    worktree_settings.as_ref(),
+                    &effective_settings,
                 )?;
-                Ok(extension.slash_output("Codex Orchestration", text))
+                Ok(self.slash_output("Codex Orchestration", text))
             }
             "codex-skills" => {
                 let mut cli_args = vec!["skills".to_string(), "--root".to_string(), root.clone()];
@@ -623,8 +661,8 @@ impl zed::Extension for CodexCompanionExtension {
                     cli_args.push("--query".to_string());
                     cli_args.push(args.join(" "));
                 }
-                let text = extension.run_cli(&cli_args, worktree_settings.as_ref())?;
-                Ok(extension.slash_output("Codex Skills", text))
+                let text = self.run_cli(&cli_args, &effective_settings)?;
+                Ok(self.slash_output("Codex Skills", text))
             }
             other => Err(format!("unknown Codex Companion slash command: {other}")),
         }
@@ -642,6 +680,25 @@ fn normalize_non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn launch_settings_key(
+    server_env: &[(String, String)],
+    explicit_server_path: Option<&str>,
+    release_repo: Option<&str>,
+) -> String {
+    let mut env_vars = server_env
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>();
+    env_vars.sort();
+
+    format!(
+        "path={}\nrelease={}\n{}",
+        explicit_server_path.unwrap_or_default(),
+        release_repo.unwrap_or_default(),
+        env_vars.join("\n")
+    )
 }
 
 fn default_release_repo() -> Option<String> {
@@ -682,6 +739,46 @@ fn parse_worktree_settings(content: &str) -> Option<CodexCompanionSettings> {
         .context_servers
         .get(CONTEXT_SERVER_ID)
         .and_then(|entry| entry.settings.clone())
+}
+
+fn merge_settings(
+    base: Option<CodexCompanionSettings>,
+    overrides: Option<CodexCompanionSettings>,
+) -> CodexCompanionSettings {
+    let mut merged = base.unwrap_or_default();
+    let Some(overrides) = overrides else {
+        return merged;
+    };
+
+    macro_rules! apply_override {
+        ($field:ident) => {
+            if overrides.$field.is_some() {
+                merged.$field = overrides.$field;
+            }
+        };
+    }
+
+    apply_override!(server_path);
+    apply_override!(cache_dir);
+    apply_override!(release_repo);
+    apply_override!(ignore_globs);
+    apply_override!(max_file_bytes);
+    apply_override!(max_indexed_files);
+    apply_override!(enable_git_tools);
+    apply_override!(refresh_window_secs);
+    apply_override!(git_cache_ttl_secs);
+    apply_override!(bundle_cache_ttl_secs);
+    apply_override!(prewarm_on_start);
+    apply_override!(execution_mode);
+    apply_override!(prefer_full_access);
+    apply_override!(max_parallel_workstreams);
+    apply_override!(skill_roots);
+    apply_override!(skill_file_globs);
+    apply_override!(max_skill_bytes);
+    apply_override!(skill_cache_ttl_secs);
+    apply_override!(max_skills_per_query);
+
+    merged
 }
 
 fn strip_json_comments(input: &str) -> String {
@@ -803,9 +900,30 @@ zed::register_extension!(CodexCompanionExtension);
 #[cfg(test)]
 mod tests {
     use super::{
-        github_repo_from_url, normalize_non_empty, parse_worktree_settings, strip_json_comments,
-        strip_trailing_commas,
+        default_release_repo, github_repo_from_url, launch_settings_key, merge_settings,
+        normalize_non_empty, parse_worktree_settings, strip_json_comments, strip_trailing_commas,
+        CodexCompanionExtension, CodexCompanionSettings,
     };
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use zed_extension_api::Extension;
+
+    fn unique_temp_dir() -> PathBuf {
+        let unique = format!(
+            "codex-companion-zed-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time must be after unix epoch")
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        fs::create_dir_all(&path).expect("temp dir must be created");
+        path
+    }
 
     #[test]
     fn parse_worktree_settings_supports_jsonc_comments() {
@@ -885,6 +1003,31 @@ mod tests {
     }
 
     #[test]
+    fn merge_settings_prefers_worktree_overrides_and_keeps_base_values() {
+        let merged = merge_settings(
+            Some(CodexCompanionSettings {
+                release_repo: Some("owner/repo".to_string()),
+                max_skills_per_query: Some(4),
+                execution_mode: Some("balanced".to_string()),
+                ..CodexCompanionSettings::default()
+            }),
+            Some(CodexCompanionSettings {
+                max_skills_per_query: Some(8),
+                skill_roots: Some(vec![r"D:\downloads\agency-agents".to_string()]),
+                ..CodexCompanionSettings::default()
+            }),
+        );
+
+        assert_eq!(merged.release_repo.as_deref(), Some("owner/repo"));
+        assert_eq!(merged.max_skills_per_query, Some(8));
+        assert_eq!(merged.execution_mode.as_deref(), Some("balanced"));
+        assert_eq!(
+            merged.skill_roots,
+            Some(vec![r"D:\downloads\agency-agents".to_string()])
+        );
+    }
+
+    #[test]
     fn normalize_non_empty_trims_values() {
         assert_eq!(
             normalize_non_empty(Some("  owner/repo  ".to_string())).as_deref(),
@@ -914,6 +1057,75 @@ mod tests {
         assert_eq!(
             github_repo_from_url("https://github.com/example/codex-companion"),
             None
+        );
+    }
+
+    #[test]
+    fn launch_settings_key_changes_when_env_changes() {
+        let low = launch_settings_key(
+            &[(
+                "CODEX_COMPANION_MAX_SKILLS_PER_QUERY".to_string(),
+                "4".to_string(),
+            )],
+            Some("server-a"),
+            Some("owner/repo"),
+        );
+        let high = launch_settings_key(
+            &[(
+                "CODEX_COMPANION_MAX_SKILLS_PER_QUERY".to_string(),
+                "8".to_string(),
+            )],
+            Some("server-a"),
+            Some("owner/repo"),
+        );
+
+        assert_ne!(low, high);
+    }
+
+    #[test]
+    fn launch_settings_key_changes_when_server_path_changes() {
+        let old_path = launch_settings_key(&[], Some("server-a"), Some("owner/repo"));
+        let new_path = launch_settings_key(&[], Some("server-b"), Some("owner/repo"));
+
+        assert_ne!(old_path, new_path);
+    }
+
+    #[test]
+    fn cached_launch_config_requires_matching_settings_key() {
+        let extension = CodexCompanionExtension::new();
+        let temp_dir = unique_temp_dir();
+        let cached_binary = temp_dir.join("cached-server.exe");
+        fs::write(&cached_binary, "cached").expect("cached binary must exist");
+
+        let launch = super::ResolvedLaunchConfig {
+            server_path: cached_binary.to_string_lossy().to_string(),
+            server_env: vec![(
+                "CODEX_COMPANION_RELEASE_REPO".to_string(),
+                "owner/repo".to_string(),
+            )],
+        };
+        extension
+            .cache_launch_config("settings-a".to_string(), launch.clone())
+            .expect("launch config should be cached");
+
+        assert_eq!(
+            extension
+                .cached_launch_config("settings-a")
+                .expect("matching key should reuse the cached launch")
+                .server_path,
+            launch.server_path
+        );
+        assert!(
+            extension.cached_launch_config("settings-b").is_none(),
+            "a changed settings key must invalidate the cached launch"
+        );
+    }
+
+    #[test]
+    fn default_release_repo_uses_manifest_repository() {
+        assert_eq!(
+            default_release_repo().as_deref(),
+            Some("3JIou-home/zed-codex")
         );
     }
 }

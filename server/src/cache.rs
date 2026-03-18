@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -7,20 +8,27 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use blake3::Hasher;
 use directories::ProjectDirs;
-use rusqlite::{params, types::Type, Connection, OpenFlags, OptionalExtension, Transaction};
+use rusqlite::{
+    params, params_from_iter,
+    types::{Type, Value},
+    Connection, OpenFlags, OptionalExtension, Transaction,
+};
 use serde::de::DeserializeOwned;
+use tracing::warn;
 
 use crate::model::{FileRecord, MemoryStore, SkillCatalog, SkillRecord, WorkspaceIndex};
+use crate::text::tokenize_search_terms;
 
 const CACHE_DB_FILENAME: &str = "workspace-cache.sqlite";
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 const SCHEMA_VERSION_KEY: &str = "schema_version";
 const INDEX_GENERATION_KEY: &str = "index_generation";
 const MEMORY_GENERATION_KEY: &str = "memory_generation";
 const SKILLS_GENERATION_KEY: &str = "skills_generation";
+const MAX_WORKSPACE_QUERY_TERMS: usize = 24;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceCache {
@@ -43,10 +51,30 @@ pub struct CachedValue<T> {
     pub generation: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkspaceSearchCandidate {
+    pub path: String,
+    pub term_score: f64,
+    pub matched_terms: usize,
+}
+
 pub fn resolve_workspace_cache(
     workspace_root: &Path,
     cache_override: Option<&PathBuf>,
 ) -> Result<WorkspaceCache> {
+    if !workspace_root.exists() {
+        bail!(
+            "workspace root does not exist: {}",
+            workspace_root.display()
+        );
+    }
+    if !workspace_root.is_dir() {
+        bail!(
+            "workspace root is not a directory: {}",
+            workspace_root.display()
+        );
+    }
+
     let base_dir = match cache_override {
         Some(path) => path.clone(),
         None => ProjectDirs::from("dev", "codex", "codex-companion")
@@ -92,11 +120,22 @@ pub fn workspace_id(workspace_root: &Path) -> String {
 }
 
 pub fn load_persistent_generations(cache: &WorkspaceCache) -> Result<PersistentCacheGenerations> {
-    let connection = open_cache_read_db(cache)?;
-    read_all_generations(&connection)
+    with_cache_recovery(cache, "load persistent cache generations", || {
+        let connection = open_cache_read_db(cache)?;
+        read_all_generations(&connection)
+    })
 }
 
 pub fn load_workspace_index(
+    cache: &WorkspaceCache,
+    options_signature: &str,
+) -> Result<Option<CachedValue<WorkspaceIndex>>> {
+    with_cache_recovery(cache, "load workspace index", || {
+        load_workspace_index_inner(cache, options_signature)
+    })
+}
+
+fn load_workspace_index_inner(
     cache: &WorkspaceCache,
     options_signature: &str,
 ) -> Result<Option<CachedValue<WorkspaceIndex>>> {
@@ -173,6 +212,16 @@ pub fn save_workspace_index(
     options_signature: &str,
     index: &WorkspaceIndex,
 ) -> Result<u64> {
+    with_cache_recovery(cache, "save workspace index", || {
+        save_workspace_index_inner(cache, options_signature, index)
+    })
+}
+
+fn save_workspace_index_inner(
+    cache: &WorkspaceCache,
+    options_signature: &str,
+    index: &WorkspaceIndex,
+) -> Result<u64> {
     let mut connection = open_cache_write_db(cache)?;
     let transaction = connection.transaction()?;
     let scan_metrics_json = serde_json::to_string(&index.scan_metrics)
@@ -180,6 +229,7 @@ pub fn save_workspace_index(
 
     transaction.execute("DELETE FROM workspace_index_files", [])?;
     transaction.execute("DELETE FROM workspace_index_meta", [])?;
+    transaction.execute("DELETE FROM workspace_index_terms", [])?;
     transaction.execute(
         "INSERT INTO workspace_index_meta (
              singleton,
@@ -205,7 +255,7 @@ pub fn save_workspace_index(
     )?;
 
     {
-        let mut statement = transaction.prepare(
+        let mut file_statement = transaction.prepare(
             "INSERT INTO workspace_index_files (
                  path,
                  language,
@@ -218,9 +268,17 @@ pub fn save_workspace_index(
                  line_count
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )?;
+        let mut term_statement = transaction.prepare(
+            "INSERT INTO workspace_index_terms (
+                 path,
+                 term,
+                 field,
+                 hits
+             ) VALUES (?1, ?2, ?3, ?4)",
+        )?;
 
         for file in &index.files {
-            statement.execute(params![
+            file_statement.execute(params![
                 file.path,
                 file.language,
                 file.size,
@@ -232,6 +290,7 @@ pub fn save_workspace_index(
                 file.indexed_text,
                 file.line_count as u64,
             ])?;
+            insert_search_terms(&mut term_statement, file)?;
         }
     }
 
@@ -241,6 +300,12 @@ pub fn save_workspace_index(
 }
 
 pub fn load_memory_store(cache: &WorkspaceCache) -> Result<Option<CachedValue<MemoryStore>>> {
+    with_cache_recovery(cache, "load memory store", || {
+        load_memory_store_inner(cache)
+    })
+}
+
+fn load_memory_store_inner(cache: &WorkspaceCache) -> Result<Option<CachedValue<MemoryStore>>> {
     let connection = open_cache_read_db(cache)?;
     let generation = read_generation(&connection, MEMORY_GENERATION_KEY)?;
     let Some((workspace_id, workspace_root, updated_at)) = connection
@@ -294,6 +359,12 @@ pub fn load_memory_store(cache: &WorkspaceCache) -> Result<Option<CachedValue<Me
 }
 
 pub fn save_memory_store(cache: &WorkspaceCache, store: &MemoryStore) -> Result<u64> {
+    with_cache_recovery(cache, "save memory store", || {
+        save_memory_store_inner(cache, store)
+    })
+}
+
+fn save_memory_store_inner(cache: &WorkspaceCache, store: &MemoryStore) -> Result<u64> {
     let mut connection = open_cache_write_db(cache)?;
     let transaction = connection.transaction()?;
 
@@ -339,6 +410,15 @@ pub fn save_memory_store(cache: &WorkspaceCache, store: &MemoryStore) -> Result<
 }
 
 pub fn load_skill_catalog(
+    cache: &WorkspaceCache,
+    options_signature: &str,
+) -> Result<Option<CachedValue<SkillCatalog>>> {
+    with_cache_recovery(cache, "load skill catalog", || {
+        load_skill_catalog_inner(cache, options_signature)
+    })
+}
+
+fn load_skill_catalog_inner(
     cache: &WorkspaceCache,
     options_signature: &str,
 ) -> Result<Option<CachedValue<SkillCatalog>>> {
@@ -407,6 +487,16 @@ pub fn save_skill_catalog(
     options_signature: &str,
     catalog: &SkillCatalog,
 ) -> Result<u64> {
+    with_cache_recovery(cache, "save skill catalog", || {
+        save_skill_catalog_inner(cache, options_signature, catalog)
+    })
+}
+
+fn save_skill_catalog_inner(
+    cache: &WorkspaceCache,
+    options_signature: &str,
+    catalog: &SkillCatalog,
+) -> Result<u64> {
     let mut connection = open_cache_write_db(cache)?;
     let transaction = connection.transaction()?;
 
@@ -468,6 +558,197 @@ pub fn save_skill_catalog(
     Ok(generation)
 }
 
+pub fn search_workspace_candidates(
+    cache: &WorkspaceCache,
+    options_signature: &str,
+    query_terms: &[String],
+    limit: usize,
+) -> Result<Vec<WorkspaceSearchCandidate>> {
+    with_cache_recovery(cache, "search workspace candidates", || {
+        search_workspace_candidates_inner(cache, options_signature, query_terms, limit)
+    })
+}
+
+fn search_workspace_candidates_inner(
+    cache: &WorkspaceCache,
+    options_signature: &str,
+    query_terms: &[String],
+    limit: usize,
+) -> Result<Vec<WorkspaceSearchCandidate>> {
+    let query_terms = prepare_workspace_query_terms(query_terms);
+    if query_terms.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let connection = open_cache_read_db(cache)?;
+    let Some(cached_signature) = connection
+        .query_row(
+            "SELECT options_signature
+             FROM workspace_index_meta
+             WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    else {
+        return Ok(Vec::new());
+    };
+    if cached_signature != options_signature {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = (0..query_terms.len())
+        .map(|index| format!("?{}", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let limit_placeholder = query_terms.len() + 1;
+    let sql = format!(
+        "SELECT path,
+                SUM(
+                    CASE field
+                        WHEN 'path' THEN hits * 9.0
+                        WHEN 'symbol' THEN hits * 7.0
+                        WHEN 'preview' THEN hits * 3.5
+                        ELSE hits * 1.0
+                    END
+                ) AS term_score,
+                COUNT(DISTINCT term) AS matched_terms
+         FROM workspace_index_terms
+         WHERE term IN ({placeholders})
+         GROUP BY path
+         ORDER BY matched_terms DESC, term_score DESC, path ASC
+         LIMIT ?{limit_placeholder}"
+    );
+
+    let mut params = query_terms
+        .iter()
+        .cloned()
+        .map(Value::from)
+        .collect::<Vec<_>>();
+    params.push(Value::Integer(limit as i64));
+
+    let mut statement = connection.prepare(&sql)?;
+    let candidates = statement
+        .query_map(params_from_iter(params), |row| {
+            Ok(WorkspaceSearchCandidate {
+                path: row.get(0)?,
+                term_score: row.get(1)?,
+                matched_terms: row.get::<_, i64>(2)? as usize,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(anyhow::Error::from)?;
+    Ok(candidates)
+}
+
+fn prepare_workspace_query_terms(query_terms: &[String]) -> Vec<String> {
+    let mut prepared = Vec::new();
+    let mut seen = HashSet::new();
+
+    for term in query_terms {
+        let normalized = term.trim().to_lowercase();
+        if normalized.len() < 2 || !seen.insert(normalized.clone()) {
+            continue;
+        }
+        prepared.push(normalized);
+        if prepared.len() >= MAX_WORKSPACE_QUERY_TERMS {
+            break;
+        }
+    }
+
+    prepared
+}
+
+fn insert_search_terms(statement: &mut rusqlite::Statement<'_>, file: &FileRecord) -> Result<()> {
+    for (field, terms) in [
+        ("path", count_search_terms(&file.path, None)),
+        ("preview", count_search_terms(&file.preview, None)),
+        ("symbol", count_search_terms(&file.symbols.join(" "), None)),
+        ("body", count_search_terms(&file.indexed_text, None)),
+    ] {
+        for (term, hits) in terms {
+            statement.execute(params![file.path, term, field, hits as u64])?;
+        }
+    }
+
+    Ok(())
+}
+
+fn count_search_terms(text: &str, unique_limit: Option<usize>) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for token in tokenize_search_terms(text) {
+        if let Some(limit) = unique_limit {
+            if counts.len() >= limit && !counts.contains_key(&token) {
+                continue;
+            }
+        }
+        *counts.entry(token).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn with_cache_recovery<T>(
+    cache: &WorkspaceCache,
+    operation: &str,
+    mut action: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    match action() {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if !is_cache_corruption_error(&error) {
+                return Err(error);
+            }
+
+            warn!(
+                "resetting corrupted workspace cache {} after `{}` failed: {error:#}",
+                cache.db_path.display(),
+                operation
+            );
+            reset_cache_storage(cache)?;
+            action().with_context(|| format!("{operation} after cache reset"))
+        }
+    }
+}
+
+fn is_cache_corruption_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string().to_lowercase();
+        message.contains("not a database")
+            || message.contains("file is not a database")
+            || message.contains("database disk image is malformed")
+            || message.contains("malformed database schema")
+    })
+}
+
+fn reset_cache_storage(cache: &WorkspaceCache) -> Result<()> {
+    reset_cache_storage_path(&cache.db_path, &cache.schema_initialized)
+}
+
+fn reset_cache_storage_path(path: &Path, schema_initialized: &Arc<AtomicBool>) -> Result<()> {
+    schema_initialized.store(false, Ordering::Release);
+
+    for candidate in [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        match fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to remove corrupted cache file {}",
+                        candidate.display()
+                    )
+                })
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn open_cache_read_db(cache: &WorkspaceCache) -> Result<Connection> {
     let schema_initialized = cache.schema_initialized.load(Ordering::Acquire);
     if !schema_initialized {
@@ -481,6 +762,28 @@ fn open_cache_write_db(cache: &WorkspaceCache) -> Result<Connection> {
 }
 
 fn open_cache_write_db_path(
+    path: &Path,
+    schema_initialized: &Arc<AtomicBool>,
+) -> Result<Connection> {
+    match open_cache_write_db_path_inner(path, schema_initialized) {
+        Ok(connection) => Ok(connection),
+        Err(error) => {
+            if !is_cache_corruption_error(&error) {
+                return Err(error);
+            }
+
+            warn!(
+                "resetting corrupted workspace cache {} while opening write connection: {error:#}",
+                path.display()
+            );
+            reset_cache_storage_path(path, schema_initialized)?;
+            open_cache_write_db_path_inner(path, schema_initialized)
+                .with_context(|| format!("failed to reinitialize cache at {}", path.display()))
+        }
+    }
+}
+
+fn open_cache_write_db_path_inner(
     path: &Path,
     schema_initialized: &Arc<AtomicBool>,
 ) -> Result<Connection> {
@@ -556,10 +859,12 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
         connection.execute_batch(
             "DROP TABLE IF EXISTS workspace_index_files;
              DROP TABLE IF EXISTS workspace_index_meta;
+             DROP TABLE IF EXISTS workspace_index_terms;
              DROP TABLE IF EXISTS memory_entries;
              DROP TABLE IF EXISTS memory_store;
              DROP TABLE IF EXISTS skill_records;
              DROP TABLE IF EXISTS skill_catalog_meta;
+             DROP INDEX IF EXISTS idx_workspace_index_terms_term;
              DELETE FROM metadata;",
         )?;
     }
@@ -587,6 +892,15 @@ fn ensure_schema(connection: &Connection) -> Result<()> {
              indexed_text TEXT NOT NULL,
              line_count INTEGER NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS workspace_index_terms (
+             path TEXT NOT NULL,
+             term TEXT NOT NULL,
+             field TEXT NOT NULL,
+             hits INTEGER NOT NULL,
+             PRIMARY KEY (path, term, field)
+         );
+         CREATE INDEX IF NOT EXISTS idx_workspace_index_terms_term
+             ON workspace_index_terms (term);
          CREATE TABLE IF NOT EXISTS memory_store (
              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
              workspace_id TEXT NOT NULL,
@@ -738,181 +1052,4 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
-    };
-
-    use super::{
-        load_memory_store, load_persistent_generations, load_skill_catalog, load_workspace_index,
-        resolve_workspace_cache, save_memory_store, save_skill_catalog, save_workspace_index,
-        workspace_id,
-    };
-    use crate::model::{
-        MemoryRecord, MemoryStore, ScanMetrics, SkillCatalog, SkillRecord, WorkspaceIndex,
-    };
-
-    fn unique_temp_dir() -> PathBuf {
-        let unique = format!(
-            "codex-companion-cache-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time must be after unix epoch")
-                .as_nanos()
-        );
-        let path = std::env::temp_dir().join(unique);
-        fs::create_dir_all(&path).expect("temp dir must be created");
-        path
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn workspace_id_normalizes_case_on_windows() {
-        assert_eq!(
-            workspace_id(Path::new(r"C:\Users\Demo\Repo")),
-            workspace_id(Path::new(r"c:\users\demo\repo"))
-        );
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn workspace_id_preserves_case_on_case_sensitive_platforms() {
-        assert_ne!(
-            workspace_id(Path::new("/tmp/Repo")),
-            workspace_id(Path::new("/tmp/repo"))
-        );
-    }
-
-    #[test]
-    fn sqlite_workspace_cache_roundtrips_index_and_generations() {
-        let root = unique_temp_dir();
-        let cache_dir = unique_temp_dir();
-        let cache = resolve_workspace_cache(&root, Some(&cache_dir)).expect("cache must resolve");
-        let options_signature = "index-options-v1";
-        let index = WorkspaceIndex {
-            format_version: 2,
-            workspace_id: cache.workspace_id.clone(),
-            workspace_root: root.display().to_string(),
-            indexed_at: "2026-03-18T00:00:00Z".to_string(),
-            total_scanned_files: 1,
-            total_indexed_bytes: 12,
-            files: vec![crate::model::FileRecord {
-                path: "src/main.rs".to_string(),
-                language: "rust".to_string(),
-                size: 12,
-                modified_unix_nanos: 42,
-                hash: "abc".to_string(),
-                preview: "fn main() {}".to_string(),
-                symbols: vec!["main".to_string()],
-                indexed_text: "fn main() {}".to_string(),
-                line_count: 1,
-            }],
-            scan_metrics: ScanMetrics {
-                reused_files: 0,
-                reindexed_files: 1,
-                skipped_files: 0,
-            },
-        };
-
-        let generation =
-            save_workspace_index(&cache, options_signature, &index).expect("index must save");
-        assert_eq!(generation, 1);
-
-        let loaded = load_workspace_index(&cache, options_signature)
-            .expect("index must load")
-            .expect("index must exist");
-        assert_eq!(loaded.generation, 1);
-        assert_eq!(loaded.value.files.len(), 1);
-        assert_eq!(loaded.value.files[0].modified_unix_nanos, 42);
-        assert!(load_workspace_index(&cache, "different-options")
-            .expect("mismatched signature load must succeed")
-            .is_none());
-
-        let generations =
-            load_persistent_generations(&cache).expect("generations must be readable");
-        assert_eq!(generations.index, 1);
-        assert_eq!(generations.memory, 0);
-        assert_eq!(generations.skills, 0);
-    }
-
-    #[test]
-    fn sqlite_workspace_cache_roundtrips_memories() {
-        let root = unique_temp_dir();
-        let cache_dir = unique_temp_dir();
-        let cache = resolve_workspace_cache(&root, Some(&cache_dir)).expect("cache must resolve");
-        let store = MemoryStore {
-            workspace_id: cache.workspace_id.clone(),
-            workspace_root: root.display().to_string(),
-            updated_at: "2026-03-18T00:00:00Z".to_string(),
-            entries: vec![MemoryRecord {
-                id: "memo-1".to_string(),
-                title: "Decision".to_string(),
-                content: "Use SQLite".to_string(),
-                tags: vec!["cache".to_string()],
-                importance: "high".to_string(),
-                created_at: "2026-03-18T00:00:00Z".to_string(),
-                updated_at: "2026-03-18T00:00:00Z".to_string(),
-            }],
-        };
-
-        let generation = save_memory_store(&cache, &store).expect("memory store must save");
-        assert_eq!(generation, 1);
-
-        let loaded = load_memory_store(&cache)
-            .expect("memory store must load")
-            .expect("memory store must exist");
-        assert_eq!(loaded.generation, 1);
-        assert_eq!(loaded.value.entries.len(), 1);
-        assert_eq!(loaded.value.entries[0].title, "Decision");
-        assert_eq!(loaded.value.entries[0].tags, vec!["cache".to_string()]);
-    }
-
-    #[test]
-    fn sqlite_workspace_cache_roundtrips_skills_and_generations() {
-        let root = unique_temp_dir();
-        let cache_dir = unique_temp_dir();
-        let cache = resolve_workspace_cache(&root, Some(&cache_dir)).expect("cache must resolve");
-        let options_signature = "skill-options-v1";
-        let catalog = SkillCatalog {
-            roots: vec![r"D:\downloads\agency-agents".to_string()],
-            indexed_at: "2026-03-18T00:00:00Z".to_string(),
-            total_skills: 1,
-            skills: vec![SkillRecord {
-                id: "skill-1".to_string(),
-                name: "Software Architect".to_string(),
-                description: "Design durable systems".to_string(),
-                path: "engineering/software-architect.md".to_string(),
-                source_root: r"D:\downloads\agency-agents".to_string(),
-                category: "engineering".to_string(),
-                emoji: Some("architect".to_string()),
-                vibe: Some("trade-off conscious".to_string()),
-                tags: vec!["architecture".to_string(), "cache".to_string()],
-                preview: "Use SQLite with WAL.".to_string(),
-                content: "# Software Architect".to_string(),
-            }],
-        };
-
-        let generation = save_skill_catalog(&cache, options_signature, &catalog)
-            .expect("skill catalog must save");
-        assert_eq!(generation, 1);
-
-        let loaded = load_skill_catalog(&cache, options_signature)
-            .expect("skill catalog must load")
-            .expect("skill catalog must exist");
-        assert_eq!(loaded.generation, 1);
-        assert_eq!(loaded.value.total_skills, 1);
-        assert_eq!(loaded.value.skills[0].name, "Software Architect");
-        assert!(load_skill_catalog(&cache, "different-skill-options")
-            .expect("mismatched skill signature load must succeed")
-            .is_none());
-
-        let generations =
-            load_persistent_generations(&cache).expect("generations must be readable");
-        assert_eq!(generations.index, 0);
-        assert_eq!(generations.memory, 0);
-        assert_eq!(generations.skills, 1);
-    }
-}
+mod tests;

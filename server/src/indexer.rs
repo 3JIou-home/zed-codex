@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     path::Path,
     sync::OnceLock,
@@ -13,11 +13,14 @@ use regex::Regex;
 use tracing::warn;
 
 use crate::{
-    cache::{load_workspace_index, save_workspace_index, WorkspaceCache},
+    cache::{
+        load_workspace_index, save_workspace_index, search_workspace_candidates, WorkspaceCache,
+    },
     model::{
         DirectoryCount, FileRecord, LanguageCount, ScanMetrics, SearchHit, WorkspaceIndex,
         WorkspaceOverview,
     },
+    text::tokenize_query,
 };
 
 const FORMAT_VERSION: u32 = 2;
@@ -245,50 +248,70 @@ pub fn search_workspace(index: &WorkspaceIndex, query: &str, limit: usize) -> Ve
         return Vec::new();
     }
 
-    let tokens = tokenize(query);
-    let mut hits = index
+    let tokens = tokenize_query(query);
+    let file_refs = index.files.iter().collect::<Vec<_>>();
+    search_workspace_in_files(
+        &file_refs,
+        &normalized_query,
+        &tokens,
+        limit,
+        &HashMap::new(),
+    )
+}
+
+pub fn search_workspace_cached(
+    index: &WorkspaceIndex,
+    cache: &WorkspaceCache,
+    options: &IndexOptions,
+    query: &str,
+    limit: usize,
+) -> Vec<SearchHit> {
+    let normalized_query = query.trim().to_lowercase();
+    if normalized_query.is_empty() {
+        return Vec::new();
+    }
+
+    let tokens = tokenize_query(query);
+    let options_signature = index_options_signature(options);
+    let candidate_lookup = match search_workspace_candidates(
+        cache,
+        &options_signature,
+        &tokens,
+        candidate_limit(limit),
+    ) {
+        Ok(candidates) => candidates
+            .into_iter()
+            .map(|candidate| {
+                let boost = candidate.term_score + candidate.matched_terms as f64 * 2.0;
+                (candidate.path, boost)
+            })
+            .collect::<HashMap<_, _>>(),
+        Err(error) => {
+            warn!(
+                "failed to query workspace search candidates from {}: {error}",
+                cache.db_path.display()
+            );
+            HashMap::new()
+        }
+    };
+
+    if candidate_lookup.is_empty() {
+        return search_workspace(index, query, limit);
+    }
+
+    let candidate_paths = candidate_lookup.keys().cloned().collect::<HashSet<_>>();
+    let candidate_files = index
         .files
         .iter()
-        .filter_map(|file| {
-            let score = score_file(file, &normalized_query, &tokens);
-            if score <= 0.0 {
-                return None;
-            }
-
-            let (line, snippet) = best_snippet(&file.indexed_text, &normalized_query, &tokens);
-            let matching_symbols = file
-                .symbols
-                .iter()
-                .filter(|symbol| {
-                    let symbol_lower = symbol.to_lowercase();
-                    symbol_lower.contains(&normalized_query)
-                        || tokens.iter().any(|token| symbol_lower.contains(token))
-                })
-                .take(6)
-                .cloned()
-                .collect::<Vec<_>>();
-
-            Some(SearchHit {
-                path: file.path.clone(),
-                language: file.language.clone(),
-                score,
-                line,
-                snippet,
-                summary: file.preview.clone(),
-                matching_symbols,
-            })
-        })
+        .filter(|file| candidate_paths.contains(&file.path))
         .collect::<Vec<_>>();
-
-    hits.sort_by(|left, right| {
-        right
-            .score
-            .partial_cmp(&left.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    hits.truncate(limit);
-    hits
+    search_workspace_in_files(
+        &candidate_files,
+        &normalized_query,
+        &tokens,
+        limit,
+        &candidate_lookup,
+    )
 }
 
 fn build_ignore_set(extra_globs: &[String]) -> Result<GlobSet> {
@@ -470,20 +493,82 @@ fn is_probably_binary(bytes: &[u8]) -> bool {
     suspicious as f64 / sample_len as f64 > 0.15
 }
 
-fn tokenize(input: &str) -> Vec<String> {
-    input
-        .split(|character: char| {
-            !character.is_alphanumeric() && character != '_' && character != '-'
+fn search_workspace_in_files(
+    files: &[&FileRecord],
+    normalized_query: &str,
+    tokens: &[String],
+    limit: usize,
+    candidate_boosts: &HashMap<String, f64>,
+) -> Vec<SearchHit> {
+    let mut hits = files
+        .iter()
+        .filter_map(|file| {
+            let score = score_file(
+                file,
+                normalized_query,
+                tokens,
+                candidate_boosts.get(&file.path).copied(),
+            );
+            if score <= 0.0 {
+                return None;
+            }
+
+            let (line, snippet) = best_snippet(&file.indexed_text, normalized_query, tokens);
+            let matching_symbols = file
+                .symbols
+                .iter()
+                .filter(|symbol| {
+                    let symbol_lower = symbol.to_lowercase();
+                    symbol_lower == normalized_query
+                        || symbol_lower.contains(normalized_query)
+                        || tokens.iter().any(|token| symbol_lower.contains(token))
+                })
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>();
+
+            Some(SearchHit {
+                path: file.path.clone(),
+                language: file.language.clone(),
+                score,
+                line,
+                snippet,
+                summary: file.preview.clone(),
+                matching_symbols,
+            })
         })
-        .filter(|piece| !piece.is_empty())
-        .map(|piece| piece.to_lowercase())
-        .collect()
+        .collect::<Vec<_>>();
+
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    hits.truncate(limit);
+    hits
 }
 
-fn score_file(file: &FileRecord, normalized_query: &str, tokens: &[String]) -> f64 {
+fn candidate_limit(limit: usize) -> usize {
+    limit.saturating_mul(8).max(24)
+}
+
+fn score_file(
+    file: &FileRecord,
+    normalized_query: &str,
+    tokens: &[String],
+    candidate_boost: Option<f64>,
+) -> f64 {
     let path = file.path.to_lowercase();
     let preview = file.preview.to_lowercase();
-    let symbols = file.symbols.join(" ").to_lowercase();
+    let file_name = file
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(file.path.as_str())
+        .to_lowercase();
+    let symbols_joined = file.symbols.join(" ").to_lowercase();
     let body = file.indexed_text.to_lowercase();
 
     let mut score = 0.0;
@@ -496,12 +581,31 @@ fn score_file(file: &FileRecord, normalized_query: &str, tokens: &[String]) -> f
     if body.contains(normalized_query) {
         score += 12.0;
     }
+    if file_name == normalized_query {
+        score += 22.0;
+    }
+    if tokenize_query(&path)
+        .iter()
+        .any(|segment| segment == normalized_query)
+    {
+        score += 10.0;
+    }
+    if file
+        .symbols
+        .iter()
+        .map(|symbol| symbol.to_lowercase())
+        .any(|symbol| symbol == normalized_query)
+    {
+        score += 20.0;
+    }
+
+    let mut body_token_matches = 0usize;
 
     for token in tokens {
         if path.contains(token) {
             score += 7.0;
         }
-        if symbols.contains(token) {
+        if symbols_joined.contains(token) {
             score += 5.0;
         }
         if preview.contains(token) {
@@ -509,7 +613,31 @@ fn score_file(file: &FileRecord, normalized_query: &str, tokens: &[String]) -> f
         }
         if body.contains(token) {
             score += 1.5;
+            body_token_matches += 1;
         }
+    }
+
+    if !tokens.is_empty() {
+        let distinct_matches = tokens
+            .iter()
+            .filter(|token| {
+                path.contains(*token)
+                    || symbols_joined.contains(*token)
+                    || preview.contains(*token)
+                    || body.contains(*token)
+            })
+            .count();
+        if distinct_matches == tokens.len() {
+            score += 9.0;
+        } else if distinct_matches > 1 {
+            score += distinct_matches as f64 * 2.5;
+        }
+    }
+    if body_token_matches > 1 {
+        score += body_token_matches as f64;
+    }
+    if let Some(boost) = candidate_boost {
+        score += boost.min(32.0);
     }
 
     score
@@ -517,26 +645,46 @@ fn score_file(file: &FileRecord, normalized_query: &str, tokens: &[String]) -> f
 
 fn best_snippet(text: &str, normalized_query: &str, tokens: &[String]) -> (Option<usize>, String) {
     let lines = text.lines().collect::<Vec<_>>();
+    let mut best_match = None;
+
     for (index, line) in lines.iter().enumerate() {
-        let lower = line.to_lowercase();
-        let matched = lower.contains(normalized_query)
-            || tokens
-                .iter()
-                .any(|token| !token.is_empty() && lower.contains(token));
-        if matched {
-            let start = index.saturating_sub(1);
-            let end = (index + 2).min(lines.len().saturating_sub(1));
-            let snippet = (start..=end)
-                .map(|line_index| {
-                    format!("{:>4}: {}", line_index + 1, lines[line_index].trim_end())
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            return (Some(index + 1), snippet);
+        let score = score_snippet_line(line, normalized_query, tokens);
+        if score > 0.0 {
+            match best_match {
+                Some((best_score, _, _)) if best_score >= score => {}
+                _ => best_match = Some((score, index, *line)),
+            }
         }
     }
 
+    if let Some((_, index, _)) = best_match {
+        let start = index.saturating_sub(1);
+        let end = (index + 1).min(lines.len().saturating_sub(1));
+        let snippet = (start..=end)
+            .map(|line_index| format!("{:>4}: {}", line_index + 1, lines[line_index].trim_end()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return (Some(index + 1), snippet);
+    }
+
     (None, make_preview(text))
+}
+
+fn score_snippet_line(line: &str, normalized_query: &str, tokens: &[String]) -> f64 {
+    let lower = line.to_lowercase();
+    let mut score = 0.0;
+    if lower.contains(normalized_query) {
+        score += 10.0;
+    }
+    let token_hits = tokens
+        .iter()
+        .filter(|token| !token.is_empty() && lower.contains(*token))
+        .count();
+    score += token_hits as f64 * 2.5;
+    if !tokens.is_empty() && token_hits == tokens.len() {
+        score += 4.0;
+    }
+    score
 }
 
 fn first_directory(path: &str) -> Option<String> {
@@ -564,154 +712,4 @@ fn is_key_file(path: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{build_workspace_overview, extract_symbols, search_workspace, tokenize};
-    use crate::model::{FileRecord, ScanMetrics, WorkspaceIndex};
-
-    #[test]
-    fn tokenize_splits_code_like_input() {
-        let tokens = tokenize("review login-flow.ts for cache invalidation");
-        assert!(!tokens.is_empty());
-        assert!(tokens.contains(&"cache".to_string()));
-    }
-
-    #[test]
-    fn extract_symbols_finds_common_patterns() {
-        let text = r#"
-            pub async fn refresh_cache() {}
-            struct WorkspaceState {}
-            ## Heading
-        "#;
-
-        let symbols = extract_symbols(text);
-        assert!(symbols.iter().any(|symbol| symbol == "refresh_cache"));
-        assert!(symbols.iter().any(|symbol| symbol == "WorkspaceState"));
-        assert!(symbols.len() >= 2);
-    }
-
-    #[test]
-    fn extract_symbols_supports_common_non_rust_patterns() {
-        let text = r#"
-            export const buildContext = async () => {};
-            suspend fun refreshIndex() {}
-            public static void Main(String[] args) {}
-        "#;
-
-        let symbols = extract_symbols(text);
-        assert!(symbols.iter().any(|symbol| symbol == "buildContext"));
-        assert!(symbols.iter().any(|symbol| symbol == "refreshIndex"));
-        assert!(symbols.iter().any(|symbol| symbol == "Main"));
-    }
-
-    #[test]
-    fn search_workspace_prefers_matching_paths() {
-        let index = WorkspaceIndex {
-            format_version: 2,
-            workspace_id: "workspace".to_string(),
-            workspace_root: "/tmp/demo".to_string(),
-            indexed_at: "2026-03-17T00:00:00Z".to_string(),
-            total_scanned_files: 2,
-            total_indexed_bytes: 100,
-            scan_metrics: ScanMetrics::default(),
-            files: vec![
-                FileRecord {
-                    path: "src/cache.rs".to_string(),
-                    language: "rust".to_string(),
-                    size: 50,
-                    modified_unix_nanos: 0,
-                    hash: "a".to_string(),
-                    preview: "refresh cache and store index".to_string(),
-                    symbols: vec!["refresh_cache".to_string()],
-                    indexed_text: "fn refresh_cache() {}".to_string(),
-                    line_count: 1,
-                },
-                FileRecord {
-                    path: "src/main.rs".to_string(),
-                    language: "rust".to_string(),
-                    size: 50,
-                    modified_unix_nanos: 0,
-                    hash: "b".to_string(),
-                    preview: "application entrypoint".to_string(),
-                    symbols: vec!["main".to_string()],
-                    indexed_text: "fn main() {}".to_string(),
-                    line_count: 1,
-                },
-            ],
-        };
-
-        let hits = search_workspace(&index, "cache", 10);
-        assert_eq!(
-            hits.first().map(|hit| hit.path.as_str()),
-            Some("src/cache.rs")
-        );
-    }
-
-    #[test]
-    fn workspace_overview_sorts_languages_by_file_count() {
-        let index = WorkspaceIndex {
-            format_version: 2,
-            workspace_id: "workspace".to_string(),
-            workspace_root: "/tmp/demo".to_string(),
-            indexed_at: "2026-03-17T00:00:00Z".to_string(),
-            total_scanned_files: 4,
-            total_indexed_bytes: 100,
-            scan_metrics: ScanMetrics::default(),
-            files: vec![
-                FileRecord {
-                    path: "src/lib.rs".to_string(),
-                    language: "rust".to_string(),
-                    size: 10,
-                    modified_unix_nanos: 0,
-                    hash: "1".to_string(),
-                    preview: "rust".to_string(),
-                    symbols: Vec::new(),
-                    indexed_text: String::new(),
-                    line_count: 1,
-                },
-                FileRecord {
-                    path: "src/main.rs".to_string(),
-                    language: "rust".to_string(),
-                    size: 10,
-                    modified_unix_nanos: 0,
-                    hash: "2".to_string(),
-                    preview: "rust".to_string(),
-                    symbols: Vec::new(),
-                    indexed_text: String::new(),
-                    line_count: 1,
-                },
-                FileRecord {
-                    path: "README.md".to_string(),
-                    language: "markdown".to_string(),
-                    size: 10,
-                    modified_unix_nanos: 0,
-                    hash: "3".to_string(),
-                    preview: "markdown".to_string(),
-                    symbols: Vec::new(),
-                    indexed_text: String::new(),
-                    line_count: 1,
-                },
-                FileRecord {
-                    path: "docs/guide.md".to_string(),
-                    language: "markdown".to_string(),
-                    size: 10,
-                    modified_unix_nanos: 0,
-                    hash: "4".to_string(),
-                    preview: "markdown".to_string(),
-                    symbols: Vec::new(),
-                    indexed_text: String::new(),
-                    line_count: 1,
-                },
-            ],
-        };
-
-        let overview = build_workspace_overview(&index);
-        assert_eq!(
-            overview
-                .major_languages
-                .iter()
-                .map(|language| (language.language.as_str(), language.files))
-                .collect::<Vec<_>>(),
-            vec![("markdown", 2), ("rust", 2)]
-        );
-    }
-}
+mod tests;

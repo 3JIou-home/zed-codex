@@ -4,8 +4,7 @@ description = "Persistent memory, cached workspace context, and Codex-first slas
 version = "0.1.0"
 schema_version = 1
 authors = ["batman <vlassov@kolesa.kz>"]
-# Set the canonical GitHub repository URL before relying on manifest-based
-# release_repo inference for published builds.
+repository = "https://github.com/3JIou-home/zed-codex"
 
 [context_servers.codex-companion]
 name = "Codex Companion"
