@@ -1,0 +1,101 @@
+name: Release Server
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+            bin_name: codex-companion-server
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+            bin_name: codex-companion-server
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+            bin_name: codex-companion-server.exe
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive_ext: zip
+            bin_name: codex-companion-server.exe
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+            bin_name: codex-companion-server
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+            bin_name: codex-companion-server
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release -p codex-companion-server --target ${{ matrix.target }}
+
+      - name: Package archive on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" dist/
+          tar -C dist -czf "codex-companion-server-${{ matrix.target }}.tar.gz" "${{ matrix.bin_name }}"
+
+      - name: Package archive on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "dist/${{ matrix.bin_name }}"
+          Compress-Archive -Path "dist/${{ matrix.bin_name }}" -DestinationPath "codex-companion-server-${{ matrix.target }}.zip" -Force
+
+      - name: Smoke packaged archive on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf smoke
+          mkdir -p smoke
+          tar -C smoke -xzf "codex-companion-server-${{ matrix.target }}.tar.gz"
+          "./smoke/${{ matrix.bin_name }}" status --root "$PWD" >/tmp/codex-status.txt
+          grep -q "Codex Companion Cache" /tmp/codex-status.txt
+
+      - name: Smoke packaged archive on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Remove-Item smoke -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force smoke | Out-Null
+          Expand-Archive -Path "codex-companion-server-${{ matrix.target }}.zip" -DestinationPath "smoke" -Force
+          & "smoke/${{ matrix.bin_name }}" status --root "$PWD" | Out-File -FilePath "$env:TEMP\\codex-status.txt" -Encoding utf8
+          Select-String -Path "$env:TEMP\\codex-status.txt" -Pattern "Codex Companion Cache" | Out-Null
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-companion-server-${{ matrix.target }}
+          path: codex-companion-server-${{ matrix.target }}.${{ matrix.archive_ext }}
+
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: codex-companion-server-${{ matrix.target }}.${{ matrix.archive_ext }}

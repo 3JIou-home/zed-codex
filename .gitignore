@@ -1,0 +1,7 @@
+/target
+/_tmp*
+/.zed
+/.idea
+/.vscode
+/*.log
+*.tmp

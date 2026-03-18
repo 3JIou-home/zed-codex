@@ -1,0 +1,13 @@
+{
+  "agent": {
+    "profiles": {
+      "codex-companion": {
+        "name": "Codex + Companion",
+        "enable_all_context_servers": false,
+        "context_servers": {
+          "codex-companion": {}
+        }
+      }
+    }
+  }
+}

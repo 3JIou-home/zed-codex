@@ -1,0 +1,43 @@
+id = "codex-companion"
+name = "Codex Companion"
+description = "Persistent memory, cached workspace context, and Codex-first slash commands for Zed."
+version = "0.1.0"
+schema_version = 1
+authors = ["batman <vlassov@kolesa.kz>"]
+# Set the canonical GitHub repository URL before relying on manifest-based
+# release_repo inference for published builds.
+
+[context_servers.codex-companion]
+name = "Codex Companion"
+
+[slash_commands.codex-context]
+description = "Build a cached task-focused context bundle for the current workspace"
+requires_argument = true
+
+[slash_commands.codex-memory]
+description = "Recall persistent memories stored for the current workspace"
+requires_argument = false
+
+[slash_commands.codex-cache]
+description = "Show Codex Companion cache and index status"
+requires_argument = false
+
+[slash_commands.codex-refresh]
+description = "Refresh the Codex Companion workspace index now"
+requires_argument = false
+
+[slash_commands.codex-warm]
+description = "Prewarm Codex Companion caches for the current workspace"
+requires_argument = false
+
+[slash_commands.codex-plan]
+description = "Decompose a larger task into scoped workstreams and coordination notes"
+requires_argument = true
+
+[slash_commands.codex-orchestrate]
+description = "Run the full Codex Companion orchestration flow for a larger task"
+requires_argument = true
+
+[slash_commands.codex-skills]
+description = "Search external skill libraries configured for Codex Companion"
+requires_argument = false

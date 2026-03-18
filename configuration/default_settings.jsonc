@@ -1,0 +1,73 @@
+{
+  // Read-only preview shown by Zed for the `codex-companion` context server.
+  // Do not treat this as the live settings file for your workspace or profile.
+  // Put overrides in `Agent Panel -> Settings` or in `.zed/settings.jsonc`.
+  //
+  // Thread creation and deletion are controlled by Zed's native Agent UI.
+  // `codex-companion` cannot delete old Codex threads when a new one is created.
+
+  // Optional absolute path to a prebuilt companion server binary. Useful when
+  // Zed is running from a different working directory and should not rely on
+  // local path discovery.
+  "server_path": null,
+
+  // Optional absolute directory for persistent cache and memory files.
+  "cache_dir": null,
+
+  // Optional GitHub repo in "owner/name" format. If set, the extension can
+  // download a prebuilt companion server from the latest release. If your
+  // `extension.toml` repository points at the same GitHub repo, the extension
+  // can also infer this automatically.
+  "release_repo": null,
+
+  // Additional globs to exclude from the cached workspace index.
+  "ignore_globs": ["_tmp*/**", "coverage/**", "storybook-static/**"],
+
+  // Maximum file size, in bytes, that will be indexed into the cache.
+  "max_file_bytes": 262144,
+
+  // Hard cap for the number of files stored in the cached index.
+  "max_indexed_files": 1500,
+
+  // Whether git-aware tools should be exposed.
+  "enable_git_tools": true,
+
+  // How long the server keeps an in-memory index fresh before rescanning.
+  "refresh_window_secs": 120,
+
+  // How long git status/commit summaries are reused in memory.
+  "git_cache_ttl_secs": 15,
+
+  // How long task bundles and decompositions are reused in memory.
+  "bundle_cache_ttl_secs": 180,
+
+  // Warm cache, git, and memory in the background right after server start.
+  "prewarm_on_start": true,
+
+  // Execution preference exposed to prompts and decomposition output:
+  // "careful", "balanced", or "autonomous".
+  "execution_mode": "balanced",
+
+  // Advisory hint for trusted workspaces: tell Codex to prefer full-access or
+  // auto-approved execution when the host agent supports it.
+  "prefer_full_access": true,
+
+  // Maximum number of independent workstreams suggested by task decomposition.
+  "max_parallel_workstreams": 4,
+
+  // External skill roots are empty by default in published builds. Add one or
+  // more absolute paths to local markdown agent packs if you want skill search.
+  "skill_roots": [],
+
+  // Globs used inside each skill root.
+  "skill_file_globs": ["**/*.md"],
+
+  // Maximum markdown file size, in bytes, loaded into the skill catalog.
+  "max_skill_bytes": 131072,
+
+  // How long the external skill catalog is reused in memory.
+  "skill_cache_ttl_secs": 300,
+
+  // Maximum number of skill matches to attach to a query or bundle.
+  "max_skills_per_query": 4
+}
