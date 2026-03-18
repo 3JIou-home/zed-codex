@@ -1,12 +1,16 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use anyhow::{Context, Result};
 use blake3::Hasher;
 use directories::ProjectDirs;
-use rusqlite::{params, types::Type, Connection, OptionalExtension, Transaction};
+use rusqlite::{params, types::Type, Connection, OpenFlags, OptionalExtension, Transaction};
 use serde::de::DeserializeOwned;
 
 use crate::model::{FileRecord, MemoryStore, SkillCatalog, SkillRecord, WorkspaceIndex};
@@ -23,6 +27,7 @@ pub struct WorkspaceCache {
     pub workspace_id: String,
     pub workspace_dir: PathBuf,
     pub db_path: PathBuf,
+    schema_initialized: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -63,12 +68,14 @@ pub fn resolve_workspace_cache(
     })?;
 
     let db_path = workspace_dir.join(CACHE_DB_FILENAME);
-    open_cache_db(&db_path)?;
+    let schema_initialized = Arc::new(AtomicBool::new(false));
+    open_cache_write_db_path(&db_path, &schema_initialized)?;
 
     Ok(WorkspaceCache {
         workspace_id,
         workspace_dir,
         db_path,
+        schema_initialized,
     })
 }
 
@@ -85,19 +92,15 @@ pub fn workspace_id(workspace_root: &Path) -> String {
 }
 
 pub fn load_persistent_generations(cache: &WorkspaceCache) -> Result<PersistentCacheGenerations> {
-    let connection = open_cache_db(&cache.db_path)?;
-    Ok(PersistentCacheGenerations {
-        index: read_generation(&connection, INDEX_GENERATION_KEY)?,
-        memory: read_generation(&connection, MEMORY_GENERATION_KEY)?,
-        skills: read_generation(&connection, SKILLS_GENERATION_KEY)?,
-    })
+    let connection = open_cache_read_db(cache)?;
+    read_all_generations(&connection)
 }
 
 pub fn load_workspace_index(
     cache: &WorkspaceCache,
     options_signature: &str,
 ) -> Result<Option<CachedValue<WorkspaceIndex>>> {
-    let connection = open_cache_db(&cache.db_path)?;
+    let connection = open_cache_read_db(cache)?;
     let generation = read_generation(&connection, INDEX_GENERATION_KEY)?;
     let Some((workspace_id, workspace_root, indexed_at, total_scanned_files, total_indexed_bytes, scan_metrics, format_version, cached_signature)) =
         connection
@@ -170,7 +173,7 @@ pub fn save_workspace_index(
     options_signature: &str,
     index: &WorkspaceIndex,
 ) -> Result<u64> {
-    let mut connection = open_cache_db(&cache.db_path)?;
+    let mut connection = open_cache_write_db(cache)?;
     let transaction = connection.transaction()?;
     let scan_metrics_json = serde_json::to_string(&index.scan_metrics)
         .context("failed to serialize workspace index scan metrics")?;
@@ -238,7 +241,7 @@ pub fn save_workspace_index(
 }
 
 pub fn load_memory_store(cache: &WorkspaceCache) -> Result<Option<CachedValue<MemoryStore>>> {
-    let connection = open_cache_db(&cache.db_path)?;
+    let connection = open_cache_read_db(cache)?;
     let generation = read_generation(&connection, MEMORY_GENERATION_KEY)?;
     let Some((workspace_id, workspace_root, updated_at)) = connection
         .query_row(
@@ -291,7 +294,7 @@ pub fn load_memory_store(cache: &WorkspaceCache) -> Result<Option<CachedValue<Me
 }
 
 pub fn save_memory_store(cache: &WorkspaceCache, store: &MemoryStore) -> Result<u64> {
-    let mut connection = open_cache_db(&cache.db_path)?;
+    let mut connection = open_cache_write_db(cache)?;
     let transaction = connection.transaction()?;
 
     transaction.execute("DELETE FROM memory_entries", [])?;
@@ -339,7 +342,7 @@ pub fn load_skill_catalog(
     cache: &WorkspaceCache,
     options_signature: &str,
 ) -> Result<Option<CachedValue<SkillCatalog>>> {
-    let connection = open_cache_db(&cache.db_path)?;
+    let connection = open_cache_read_db(cache)?;
     let generation = read_generation(&connection, SKILLS_GENERATION_KEY)?;
     let Some((indexed_at, total_skills, roots_json, cached_signature)) = connection
         .query_row(
@@ -404,7 +407,7 @@ pub fn save_skill_catalog(
     options_signature: &str,
     catalog: &SkillCatalog,
 ) -> Result<u64> {
-    let mut connection = open_cache_db(&cache.db_path)?;
+    let mut connection = open_cache_write_db(cache)?;
     let transaction = connection.transaction()?;
 
     transaction.execute("DELETE FROM skill_records", [])?;
@@ -465,29 +468,72 @@ pub fn save_skill_catalog(
     Ok(generation)
 }
 
-fn open_cache_db(path: &Path) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+fn open_cache_read_db(cache: &WorkspaceCache) -> Result<Connection> {
+    let schema_initialized = cache.schema_initialized.load(Ordering::Acquire);
+    if !schema_initialized {
+        return open_cache_write_db(cache);
     }
+    open_cache_db(&cache.db_path, ConnectionMode::ReadOnly, schema_initialized)
+}
 
-    let connection =
-        Connection::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    connection
-        .pragma_update(None, "journal_mode", "WAL")
-        .context("failed to enable WAL mode for workspace cache")?;
-    connection
-        .pragma_update(None, "synchronous", "NORMAL")
-        .context("failed to configure SQLite synchronous mode")?;
-    connection
-        .pragma_update(None, "temp_store", "MEMORY")
-        .context("failed to configure SQLite temp_store mode")?;
-    connection
-        .pragma_update(None, "foreign_keys", 1)
-        .context("failed to enable SQLite foreign keys")?;
+fn open_cache_write_db(cache: &WorkspaceCache) -> Result<Connection> {
+    open_cache_write_db_path(&cache.db_path, &cache.schema_initialized)
+}
 
-    ensure_schema(&connection)?;
+fn open_cache_write_db_path(
+    path: &Path,
+    schema_initialized: &Arc<AtomicBool>,
+) -> Result<Connection> {
+    let connection = open_cache_db(
+        path,
+        ConnectionMode::ReadWrite,
+        schema_initialized.load(Ordering::Acquire),
+    )?;
+    if !schema_initialized.load(Ordering::Acquire) {
+        ensure_schema(&connection)?;
+        schema_initialized.store(true, Ordering::Release);
+    }
     Ok(connection)
+}
+
+#[derive(Clone, Copy)]
+enum ConnectionMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+fn open_cache_db(
+    path: &Path,
+    mode: ConnectionMode,
+    schema_initialized: bool,
+) -> Result<Connection> {
+    match mode {
+        ConnectionMode::ReadOnly => {
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("failed to open {} in read-only mode", path.display()))
+        }
+        ConnectionMode::ReadWrite => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+
+            let connection = Connection::open(path)
+                .with_context(|| format!("failed to open {}", path.display()))?;
+            if !schema_initialized {
+                connection
+                    .pragma_update(None, "journal_mode", "WAL")
+                    .context("failed to enable WAL mode for workspace cache")?;
+            }
+            connection
+                .pragma_update(None, "synchronous", "NORMAL")
+                .context("failed to configure SQLite synchronous mode")?;
+            connection
+                .pragma_update(None, "temp_store", "MEMORY")
+                .context("failed to configure SQLite temp_store mode")?;
+            Ok(connection)
+        }
+    }
 }
 
 fn ensure_schema(connection: &Connection) -> Result<()> {
@@ -602,6 +648,38 @@ fn read_generation(connection: &Connection, key: &str) -> Result<u64> {
         })
         .transpose()
         .map(|value| value.unwrap_or_default())
+}
+
+fn read_all_generations(connection: &Connection) -> Result<PersistentCacheGenerations> {
+    let mut generations = PersistentCacheGenerations::default();
+    let mut statement = connection.prepare(
+        "SELECT key, value
+         FROM metadata
+         WHERE key IN (?1, ?2, ?3)",
+    )?;
+    let rows = statement.query_map(
+        params![
+            INDEX_GENERATION_KEY,
+            MEMORY_GENERATION_KEY,
+            SKILLS_GENERATION_KEY
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+    )?;
+
+    for row in rows {
+        let (key, value) = row?;
+        let parsed = value
+            .parse::<u64>()
+            .with_context(|| format!("invalid cached generation `{value}` for `{key}`"))?;
+        match key.as_str() {
+            INDEX_GENERATION_KEY => generations.index = parsed,
+            MEMORY_GENERATION_KEY => generations.memory = parsed,
+            SKILLS_GENERATION_KEY => generations.skills = parsed,
+            _ => {}
+        }
+    }
+
+    Ok(generations)
 }
 
 fn read_metadata_value(connection: &Connection, key: &str) -> Result<Option<String>> {
