@@ -94,9 +94,10 @@ Detailed setup steps are in [docs/TUTORIAL.ru.md](docs/TUTORIAL.ru.md).
 The companion now includes:
 
 - background prewarm on server start
+- a SQLite-backed workspace cache running in WAL mode for index, memory, and external skill catalogs
 - in-memory TTL cache for git summaries
 - in-memory TTL cache for task bundles and decompositions
-- in-memory TTL cache for external skill catalogs
+- versioned cache generations so repeated tasks invalidate cleanly after index, memory, or skill refreshes
 - an execution mode hint: `careful`, `balanced`, or `autonomous`
 - an advisory `prefer_full_access` mode for trusted workspaces
 - orchestration output designed for host agents that can parallelize work

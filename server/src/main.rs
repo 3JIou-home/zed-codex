@@ -12,7 +12,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand};
 use rmcp::{
     handler::server::{
@@ -27,19 +27,28 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tracing::warn;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    cache::{load_json, resolve_workspace_cache, save_json, WorkspaceCache},
+    cache::{
+        load_memory_store, load_persistent_generations, load_skill_catalog, load_workspace_index,
+        resolve_workspace_cache, save_memory_store, save_skill_catalog, WorkspaceCache,
+    },
     git_tools::collect_git_summary,
-    indexer::{build_workspace_overview, refresh_workspace_index, search_workspace, IndexOptions},
+    indexer::{
+        build_workspace_overview, index_options_signature, refresh_workspace_index,
+        search_workspace, IndexOptions, RefreshedWorkspaceIndex,
+    },
     model::{
         CacheStatus, ContextBundle, GitSummary, MemoryRecord, MemorySearchResults, MemoryStore,
         OrchestrationStage, SearchResults, SkillCatalog, SkillMatch, SkillSearchResults,
         SubagentSpec, TaskDecomposition, TaskOrchestration, TaskWorkstream, WarmupStatus,
         WorkspaceIndex, WorkspaceOverview,
     },
-    skills::{build_skill_catalog, search_skills, SkillIndexOptions},
+    skills::{
+        build_skill_catalog, search_skills, skill_index_options_signature, SkillIndexOptions,
+    },
 };
 
 const DEFAULT_SKILL_ROOT_CANDIDATES: &[&str] = &[];
@@ -174,16 +183,27 @@ fn existing_skill_roots(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 struct TimedCacheEntry<T> {
     value: T,
     loaded_at: Instant,
+    versions: TaskCacheVersions,
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+struct TaskCacheVersions {
+    index: u64,
+    memory: u64,
+    skills: u64,
 }
 
 #[derive(Debug, Default)]
 struct RuntimeState {
     index: Option<Arc<WorkspaceIndex>>,
     index_loaded_at: Option<Instant>,
+    index_generation: u64,
     memories: Option<MemoryStore>,
+    memory_generation: u64,
     git_summary_cache: HashMap<String, TimedCacheEntry<GitSummary>>,
     skill_catalog: Option<SkillCatalog>,
     skill_catalog_loaded_at: Option<Instant>,
+    skills_generation: u64,
     bundle_cache: HashMap<String, TimedCacheEntry<ContextBundle>>,
     decomposition_cache: HashMap<String, TimedCacheEntry<TaskDecomposition>>,
 }
@@ -199,21 +219,86 @@ struct AppState {
     config: ServerConfig,
     runtime: Arc<Mutex<RuntimeState>>,
     memory_write: Arc<Mutex<()>>,
+    index_refresh: Arc<Mutex<()>>,
+    skill_refresh: Arc<Mutex<()>>,
+    git_refresh: Arc<Mutex<()>>,
 }
 
 impl AppState {
     fn new(root: PathBuf, config: ServerConfig) -> Result<Self> {
         let cache = resolve_workspace_cache(&root, config.cache_dir_override.as_ref())?;
+        let persistent_generations = load_persistent_generations(&cache).unwrap_or_else(|error| {
+            warn!(
+                "failed to load persistent cache generations from {}: {error}",
+                cache.db_path.display()
+            );
+            Default::default()
+        });
+        let runtime = RuntimeState {
+            index_generation: persistent_generations.index,
+            memory_generation: persistent_generations.memory,
+            skills_generation: persistent_generations.skills,
+            ..RuntimeState::default()
+        };
         Ok(Self {
             root,
             cache,
             config,
-            runtime: Arc::new(Mutex::new(RuntimeState::default())),
+            runtime: Arc::new(Mutex::new(runtime)),
             memory_write: Arc::new(Mutex::new(())),
+            index_refresh: Arc::new(Mutex::new(())),
+            skill_refresh: Arc::new(Mutex::new(())),
+            git_refresh: Arc::new(Mutex::new(())),
         })
     }
 
+    async fn persistent_generations_snapshot(
+        &self,
+    ) -> Option<crate::cache::PersistentCacheGenerations> {
+        let cache = self.cache.clone();
+        match tokio::task::spawn_blocking(move || load_persistent_generations(&cache)).await {
+            Ok(Ok(generations)) => Some(generations),
+            Ok(Err(error)) => {
+                warn!(
+                    "failed to refresh persistent cache generations from {}: {error}",
+                    self.cache.db_path.display()
+                );
+                None
+            }
+            Err(error) => {
+                warn!("persistent generation refresh task failed: {error}");
+                None
+            }
+        }
+    }
+
+    fn skill_index_options(&self) -> SkillIndexOptions {
+        SkillIndexOptions {
+            roots: self.config.skill_roots.clone(),
+            include_globs: self.config.skill_file_globs.clone(),
+            max_skill_bytes: self.config.max_skill_bytes,
+        }
+    }
+
     async fn ensure_index(&self, force_refresh: bool) -> Result<Arc<WorkspaceIndex>> {
+        if !force_refresh {
+            let persistent_generations = self.persistent_generations_snapshot().await;
+            let runtime = self.runtime.lock().await;
+            if let (Some(index), Some(index_loaded_at)) = (&runtime.index, runtime.index_loaded_at)
+            {
+                if index_loaded_at.elapsed() <= Duration::from_secs(self.config.refresh_window_secs)
+                {
+                    let generation_matches = persistent_generations
+                        .map(|generations| generations.index == runtime.index_generation)
+                        .unwrap_or(true);
+                    if generation_matches {
+                        return Ok(Arc::clone(index));
+                    }
+                }
+            }
+        }
+
+        let _refresh_guard = self.index_refresh.lock().await;
         {
             let runtime = self.runtime.lock().await;
             if !force_refresh {
@@ -229,19 +314,45 @@ impl AppState {
             }
         }
 
+        if !force_refresh {
+            let cache = self.cache.clone();
+            let options_signature = index_options_signature(&self.config.index_options());
+            let cached_index = tokio::task::spawn_blocking(move || {
+                load_workspace_index(&cache, &options_signature)
+            })
+            .await
+            .map_err(|error| anyhow!("cached index load task failed: {error}"))??;
+            if let Some(cached_index) = cached_index {
+                if let Some(index_loaded_at) = indexed_at_to_instant(&cached_index.value.indexed_at)
+                {
+                    if index_loaded_at.elapsed()
+                        <= Duration::from_secs(self.config.refresh_window_secs)
+                    {
+                        let index = Arc::new(cached_index.value);
+                        let mut runtime = self.runtime.lock().await;
+                        runtime.index = Some(Arc::clone(&index));
+                        runtime.index_loaded_at = Some(index_loaded_at);
+                        runtime.index_generation = cached_index.generation;
+                        return Ok(index);
+                    }
+                }
+            }
+        }
+
         let root = self.root.clone();
         let cache = self.cache.clone();
         let options = self.config.index_options();
-        let refreshed =
+        let refreshed: RefreshedWorkspaceIndex =
             tokio::task::spawn_blocking(move || refresh_workspace_index(&root, &cache, &options))
                 .await
                 .map_err(|error| anyhow!("index refresh task failed: {error}"))??;
 
-        let refreshed = Arc::new(refreshed);
+        let refreshed_generation = refreshed.generation;
+        let refreshed = Arc::new(refreshed.index);
         let mut runtime = self.runtime.lock().await;
-        invalidate_task_caches(&mut runtime);
         runtime.index = Some(Arc::clone(&refreshed));
         runtime.index_loaded_at = Some(Instant::now());
+        runtime.index_generation = refreshed_generation;
         Ok(refreshed)
     }
 
@@ -260,43 +371,64 @@ impl AppState {
 
     async fn load_memories(&self) -> Result<MemoryStore> {
         {
+            let persistent_generations = self.persistent_generations_snapshot().await;
             let runtime = self.runtime.lock().await;
             if let Some(memories) = &runtime.memories {
-                return Ok(memories.clone());
+                let generation_matches = persistent_generations
+                    .map(|generations| generations.memory == runtime.memory_generation)
+                    .unwrap_or(true);
+                if generation_matches {
+                    return Ok(memories.clone());
+                }
             }
         }
 
-        let memory_file = self.cache.memory_file.clone();
+        let cache = self.cache.clone();
         let workspace_id = self.cache.workspace_id.clone();
         let workspace_root = self.root.display().to_string();
-        let memories = tokio::task::spawn_blocking(move || {
-            Ok::<_, anyhow::Error>(
-                load_json::<MemoryStore>(&memory_file)?.unwrap_or(MemoryStore {
-                    workspace_id,
-                    workspace_root,
-                    updated_at: Utc::now().to_rfc3339(),
-                    entries: Vec::new(),
-                }),
-            )
+        let cached_memories = tokio::task::spawn_blocking(move || {
+            Ok::<_, anyhow::Error>(load_memory_store(&cache).map(Some).unwrap_or_else(|error| {
+                warn!(
+                    "failed to load memory cache from {}: {error}",
+                    cache.db_path.display()
+                );
+                None
+            }))
         })
         .await
         .map_err(|error| anyhow!("memory load task failed: {error}"))??;
+        let (memories, generation) = cached_memories
+            .flatten()
+            .map(|cached| (cached.value, cached.generation))
+            .unwrap_or_else(|| {
+                (
+                    MemoryStore {
+                        workspace_id,
+                        workspace_root,
+                        updated_at: Utc::now().to_rfc3339(),
+                        entries: Vec::new(),
+                    },
+                    0,
+                )
+            });
 
         let mut runtime = self.runtime.lock().await;
         runtime.memories = Some(memories.clone());
+        runtime.memory_generation = generation;
         Ok(memories)
     }
 
     async fn save_memories(&self, store: MemoryStore) -> Result<()> {
-        let memory_file = self.cache.memory_file.clone();
+        let cache = self.cache.clone();
         let store_to_save = store.clone();
-        tokio::task::spawn_blocking(move || save_json(&memory_file, &store_to_save))
-            .await
-            .map_err(|error| anyhow!("memory save task failed: {error}"))??;
+        let generation =
+            tokio::task::spawn_blocking(move || save_memory_store(&cache, &store_to_save))
+                .await
+                .map_err(|error| anyhow!("memory save task failed: {error}"))??;
 
         let mut runtime = self.runtime.lock().await;
         runtime.memories = Some(store);
-        invalidate_task_caches(&mut runtime);
+        runtime.memory_generation = generation;
         Ok(())
     }
 
@@ -305,7 +437,30 @@ impl AppState {
             return Ok(None);
         }
 
+        if !force_refresh {
+            let persistent_generations = self.persistent_generations_snapshot().await;
+            let runtime = self.runtime.lock().await;
+            if let (Some(catalog), Some(loaded_at)) =
+                (&runtime.skill_catalog, runtime.skill_catalog_loaded_at)
+            {
+                if loaded_at.elapsed() <= Duration::from_secs(self.config.skill_cache_ttl_secs) {
+                    let generation_matches = persistent_generations
+                        .map(|generations| generations.skills == runtime.skills_generation)
+                        .unwrap_or(true);
+                    if generation_matches {
+                        return Ok(Some(catalog.clone()));
+                    }
+                }
+            }
+        }
+
+        let _refresh_guard = self.skill_refresh.lock().await;
         {
+            let persistent_generations = if force_refresh {
+                None
+            } else {
+                self.persistent_generations_snapshot().await
+            };
             let runtime = self.runtime.lock().await;
             if !force_refresh {
                 if let (Some(catalog), Some(loaded_at)) =
@@ -313,25 +468,69 @@ impl AppState {
                 {
                     if loaded_at.elapsed() <= Duration::from_secs(self.config.skill_cache_ttl_secs)
                     {
-                        return Ok(Some(catalog.clone()));
+                        let generation_matches = persistent_generations
+                            .map(|generations| generations.skills == runtime.skills_generation)
+                            .unwrap_or(true);
+                        if generation_matches {
+                            return Ok(Some(catalog.clone()));
+                        }
                     }
                 }
             }
         }
 
-        let options = SkillIndexOptions {
-            roots: self.config.skill_roots.clone(),
-            include_globs: self.config.skill_file_globs.clone(),
-            max_skill_bytes: self.config.max_skill_bytes,
-        };
+        let options = self.skill_index_options();
+        let options_signature = skill_index_options_signature(&options);
+        if !force_refresh {
+            let cache = self.cache.clone();
+            let cached_catalog = tokio::task::spawn_blocking(move || {
+                Ok::<_, anyhow::Error>(
+                    load_skill_catalog(&cache, &options_signature)
+                        .map(Some)
+                        .unwrap_or_else(|error| {
+                            warn!(
+                                "failed to load skill cache from {}: {error}",
+                                cache.db_path.display()
+                            );
+                            None
+                        }),
+                )
+            })
+            .await
+            .map_err(|error| anyhow!("cached skill catalog load task failed: {error}"))??;
+            if let Some(cached_catalog) = cached_catalog.flatten() {
+                if let Some(loaded_at) = indexed_at_to_instant(&cached_catalog.value.indexed_at) {
+                    if loaded_at.elapsed() <= Duration::from_secs(self.config.skill_cache_ttl_secs)
+                    {
+                        let catalog = cached_catalog.value;
+                        let mut runtime = self.runtime.lock().await;
+                        runtime.skill_catalog = Some(catalog.clone());
+                        runtime.skill_catalog_loaded_at = Some(loaded_at);
+                        runtime.skills_generation = cached_catalog.generation;
+                        return Ok(Some(catalog));
+                    }
+                }
+            }
+        }
+
+        let options = self.skill_index_options();
+        let options_signature = skill_index_options_signature(&options);
         let catalog = tokio::task::spawn_blocking(move || build_skill_catalog(&options))
             .await
             .map_err(|error| anyhow!("skill catalog task failed: {error}"))??;
 
+        let cache = self.cache.clone();
+        let catalog_to_save = catalog.clone();
+        let generation = tokio::task::spawn_blocking(move || {
+            save_skill_catalog(&cache, &options_signature, &catalog_to_save)
+        })
+        .await
+        .map_err(|error| anyhow!("skill catalog save task failed: {error}"))??;
+
         let mut runtime = self.runtime.lock().await;
-        invalidate_task_caches(&mut runtime);
         runtime.skill_catalog = Some(catalog.clone());
         runtime.skill_catalog_loaded_at = Some(Instant::now());
+        runtime.skills_generation = generation;
         Ok(Some(catalog))
     }
 
@@ -484,6 +683,21 @@ impl AppState {
             }
         }
 
+        let _refresh_guard = self.git_refresh.lock().await;
+        {
+            let mut runtime = self.runtime.lock().await;
+            prune_timed_cache(
+                &mut runtime.git_summary_cache,
+                self.config.git_cache_ttl_secs,
+                MAX_GIT_SUMMARY_CACHE_ENTRIES,
+            );
+
+            let cache_key = git_summary_cache_key(limit_commits, include_diffstat);
+            if let Some(summary) = runtime.git_summary_cache.get(&cache_key) {
+                return Some(summary.value.clone());
+            }
+        }
+
         let root = self.root.clone();
         let summary = tokio::task::spawn_blocking(move || {
             collect_git_summary(&root, limit_commits, include_diffstat)
@@ -503,6 +717,7 @@ impl AppState {
             TimedCacheEntry {
                 value: summary.clone(),
                 loaded_at: Instant::now(),
+                versions: TaskCacheVersions::default(),
             },
         );
         Some(summary)
@@ -516,6 +731,11 @@ impl AppState {
         force_refresh: bool,
     ) -> Result<ContextBundle> {
         let cache_key = task_cache_key(&task, limit, memory_limit);
+        let persistent_generations = if force_refresh {
+            None
+        } else {
+            self.persistent_generations_snapshot().await
+        };
         let cached_bundle = {
             let mut runtime = self.runtime.lock().await;
             prune_timed_cache(
@@ -524,11 +744,16 @@ impl AppState {
                 MAX_BUNDLE_CACHE_ENTRIES,
             );
 
-            if !force_refresh && can_reuse_task_cache(&runtime, &self.config) {
-                runtime
-                    .bundle_cache
-                    .get(&cache_key)
-                    .map(|entry| entry.value.clone())
+            if !force_refresh {
+                if let Some(entry) = runtime.bundle_cache.get(&cache_key) {
+                    if can_reuse_task_cache(entry, &runtime, &self.config, persistent_generations) {
+                        Some(entry.value.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -577,11 +802,13 @@ impl AppState {
             self.config.bundle_cache_ttl_secs,
             MAX_BUNDLE_CACHE_ENTRIES,
         );
+        let versions = current_task_cache_versions(&runtime);
         runtime.bundle_cache.insert(
             cache_key,
             TimedCacheEntry {
                 value: bundle.clone(),
                 loaded_at: Instant::now(),
+                versions,
             },
         );
         Ok(bundle)
@@ -595,6 +822,11 @@ impl AppState {
         force_refresh: bool,
     ) -> Result<TaskDecomposition> {
         let cache_key = task_cache_key(&task, limit, memory_limit);
+        let persistent_generations = if force_refresh {
+            None
+        } else {
+            self.persistent_generations_snapshot().await
+        };
         {
             let mut runtime = self.runtime.lock().await;
             prune_timed_cache(
@@ -603,9 +835,11 @@ impl AppState {
                 MAX_DECOMPOSITION_CACHE_ENTRIES,
             );
 
-            if !force_refresh && can_reuse_task_cache(&runtime, &self.config) {
+            if !force_refresh {
                 if let Some(entry) = runtime.decomposition_cache.get(&cache_key) {
-                    return Ok(entry.value.clone());
+                    if can_reuse_task_cache(entry, &runtime, &self.config, persistent_generations) {
+                        return Ok(entry.value.clone());
+                    }
                 }
             }
         }
@@ -668,11 +902,13 @@ impl AppState {
             self.config.bundle_cache_ttl_secs,
             MAX_DECOMPOSITION_CACHE_ENTRIES,
         );
+        let versions = current_task_cache_versions(&runtime);
         runtime.decomposition_cache.insert(
             cache_key,
             TimedCacheEntry {
                 value: decomposition.clone(),
                 loaded_at: Instant::now(),
+                versions,
             },
         );
     }
@@ -1392,12 +1628,39 @@ fn git_summary_cache_key(limit_commits: usize, include_diffstat: bool) -> String
     format!("{limit_commits}:{include_diffstat}")
 }
 
-fn invalidate_task_caches(runtime: &mut RuntimeState) {
-    runtime.bundle_cache.clear();
-    runtime.decomposition_cache.clear();
+fn current_task_cache_versions(runtime: &RuntimeState) -> TaskCacheVersions {
+    TaskCacheVersions {
+        index: runtime.index_generation,
+        memory: runtime.memory_generation,
+        skills: runtime.skills_generation,
+    }
 }
 
-fn can_reuse_task_cache(runtime: &RuntimeState, config: &ServerConfig) -> bool {
+fn effective_task_cache_versions(
+    runtime: &RuntimeState,
+    config: &ServerConfig,
+    persistent_generations: Option<crate::cache::PersistentCacheGenerations>,
+) -> TaskCacheVersions {
+    let runtime_versions = current_task_cache_versions(runtime);
+    let mut versions = persistent_generations
+        .map(|generations| TaskCacheVersions {
+            index: generations.index,
+            memory: generations.memory,
+            skills: generations.skills,
+        })
+        .unwrap_or(runtime_versions);
+    if config.skill_roots.is_empty() {
+        versions.skills = 0;
+    }
+    versions
+}
+
+fn can_reuse_task_cache<T>(
+    entry: &TimedCacheEntry<T>,
+    runtime: &RuntimeState,
+    config: &ServerConfig,
+    persistent_generations: Option<crate::cache::PersistentCacheGenerations>,
+) -> bool {
     let index_fresh = runtime
         .index_loaded_at
         .map(|loaded_at| loaded_at.elapsed() <= Duration::from_secs(config.refresh_window_secs))
@@ -1406,14 +1669,34 @@ fn can_reuse_task_cache(runtime: &RuntimeState, config: &ServerConfig) -> bool {
         return false;
     }
 
-    if config.skill_roots.is_empty() {
-        return true;
+    let current_versions = effective_task_cache_versions(runtime, config, persistent_generations);
+    if entry.versions.index != current_versions.index
+        || entry.versions.memory != current_versions.memory
+    {
+        return false;
     }
 
-    runtime
+    if config.skill_roots.is_empty() {
+        return entry.versions.skills == 0 || entry.versions.skills == current_versions.skills;
+    }
+
+    let skills_fresh = runtime
         .skill_catalog_loaded_at
         .map(|loaded_at| loaded_at.elapsed() <= Duration::from_secs(config.skill_cache_ttl_secs))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    skills_fresh && entry.versions.skills == current_versions.skills
+}
+
+fn indexed_at_to_instant(indexed_at: &str) -> Option<Instant> {
+    let parsed = DateTime::parse_from_rfc3339(indexed_at)
+        .ok()?
+        .with_timezone(&Utc);
+    let age = Utc::now().signed_duration_since(parsed);
+    if age <= chrono::Duration::zero() {
+        return Some(Instant::now());
+    }
+
+    Instant::now().checked_sub(age.to_std().ok()?)
 }
 
 fn prune_timed_cache<T>(
@@ -2416,8 +2699,9 @@ mod tests {
         build_task_decomposition, build_task_orchestration, can_reuse_task_cache,
         configured_skill_roots, default_skill_root_candidates, existing_skill_roots,
         git_summary_cache_key, normalize_execution_mode, prune_timed_cache, RuntimeState,
-        ServerConfig, TimedCacheEntry,
+        ServerConfig, TaskCacheVersions, TimedCacheEntry,
     };
+    use crate::cache::PersistentCacheGenerations;
     use crate::model::{
         ContextBundle, MemoryRecord, ScanMetrics, SearchHit, SkillMatch, WorkspaceOverview,
     };
@@ -2476,6 +2760,7 @@ mod tests {
             TimedCacheEntry {
                 value: "expired".to_string(),
                 loaded_at: Instant::now() - Duration::from_secs(30),
+                versions: TaskCacheVersions::default(),
             },
         );
         cache.insert(
@@ -2483,6 +2768,7 @@ mod tests {
             TimedCacheEntry {
                 value: "oldest".to_string(),
                 loaded_at: Instant::now() - Duration::from_secs(3),
+                versions: TaskCacheVersions::default(),
             },
         );
         cache.insert(
@@ -2490,6 +2776,7 @@ mod tests {
             TimedCacheEntry {
                 value: "newer".to_string(),
                 loaded_at: Instant::now() - Duration::from_secs(2),
+                versions: TaskCacheVersions::default(),
             },
         );
         cache.insert(
@@ -2497,6 +2784,7 @@ mod tests {
             TimedCacheEntry {
                 value: "newest".to_string(),
                 loaded_at: Instant::now() - Duration::from_secs(1),
+                versions: TaskCacheVersions::default(),
             },
         );
 
@@ -2528,7 +2816,17 @@ mod tests {
     fn task_cache_requires_fresh_index() {
         let runtime = RuntimeState {
             index_loaded_at: Some(Instant::now() - Duration::from_secs(10)),
+            index_generation: 1,
             ..RuntimeState::default()
+        };
+        let entry = TimedCacheEntry {
+            value: (),
+            loaded_at: Instant::now(),
+            versions: TaskCacheVersions {
+                index: 1,
+                memory: 0,
+                skills: 0,
+            },
         };
         let config = ServerConfig {
             cache_dir_override: None,
@@ -2550,15 +2848,26 @@ mod tests {
             max_skills_per_query: 4,
         };
 
-        assert!(!can_reuse_task_cache(&runtime, &config));
+        assert!(!can_reuse_task_cache(&entry, &runtime, &config, None));
     }
 
     #[test]
     fn task_cache_requires_fresh_skill_catalog_when_skills_are_enabled() {
         let runtime = RuntimeState {
             index_loaded_at: Some(Instant::now()),
+            index_generation: 1,
             skill_catalog_loaded_at: Some(Instant::now() - Duration::from_secs(10)),
+            skills_generation: 1,
             ..RuntimeState::default()
+        };
+        let entry = TimedCacheEntry {
+            value: (),
+            loaded_at: Instant::now(),
+            versions: TaskCacheVersions {
+                index: 1,
+                memory: 0,
+                skills: 1,
+            },
         };
         let config = ServerConfig {
             cache_dir_override: None,
@@ -2580,7 +2889,99 @@ mod tests {
             max_skills_per_query: 4,
         };
 
-        assert!(!can_reuse_task_cache(&runtime, &config));
+        assert!(!can_reuse_task_cache(&entry, &runtime, &config, None));
+    }
+
+    #[test]
+    fn task_cache_requires_matching_generations() {
+        let runtime = RuntimeState {
+            index_loaded_at: Some(Instant::now()),
+            index_generation: 2,
+            memory_generation: 1,
+            ..RuntimeState::default()
+        };
+        let entry = TimedCacheEntry {
+            value: (),
+            loaded_at: Instant::now(),
+            versions: TaskCacheVersions {
+                index: 1,
+                memory: 1,
+                skills: 0,
+            },
+        };
+        let config = ServerConfig {
+            cache_dir_override: None,
+            max_file_bytes: 262_144,
+            max_indexed_files: 1_500,
+            ignore_globs: Vec::new(),
+            enable_git_tools: true,
+            refresh_window_secs: 120,
+            git_cache_ttl_secs: 15,
+            bundle_cache_ttl_secs: 180,
+            skill_cache_ttl_secs: 300,
+            prewarm_on_start: true,
+            execution_mode: "balanced".to_string(),
+            prefer_full_access: true,
+            max_parallel_workstreams: 4,
+            skill_roots: Vec::new(),
+            skill_file_globs: vec!["**/*.md".to_string()],
+            max_skill_bytes: 131_072,
+            max_skills_per_query: 4,
+        };
+
+        assert!(!can_reuse_task_cache(&entry, &runtime, &config, None));
+    }
+
+    #[test]
+    fn task_cache_requires_matching_persistent_generations() {
+        let runtime = RuntimeState {
+            index_loaded_at: Some(Instant::now()),
+            index_generation: 1,
+            memory_generation: 2,
+            skill_catalog_loaded_at: Some(Instant::now()),
+            skills_generation: 3,
+            ..RuntimeState::default()
+        };
+        let entry = TimedCacheEntry {
+            value: (),
+            loaded_at: Instant::now(),
+            versions: TaskCacheVersions {
+                index: 1,
+                memory: 2,
+                skills: 3,
+            },
+        };
+        let config = ServerConfig {
+            cache_dir_override: None,
+            max_file_bytes: 262_144,
+            max_indexed_files: 1_500,
+            ignore_globs: Vec::new(),
+            enable_git_tools: true,
+            refresh_window_secs: 120,
+            git_cache_ttl_secs: 15,
+            bundle_cache_ttl_secs: 180,
+            skill_cache_ttl_secs: 300,
+            prewarm_on_start: true,
+            execution_mode: "balanced".to_string(),
+            prefer_full_access: true,
+            max_parallel_workstreams: 4,
+            skill_roots: vec![PathBuf::from(r"D:\downloads\agency-agents")],
+            skill_file_globs: vec!["**/*.md".to_string()],
+            max_skill_bytes: 131_072,
+            max_skills_per_query: 4,
+        };
+        let persistent_generations = PersistentCacheGenerations {
+            index: 2,
+            memory: 2,
+            skills: 3,
+        };
+
+        assert!(!can_reuse_task_cache(
+            &entry,
+            &runtime,
+            &config,
+            Some(persistent_generations)
+        ));
     }
 
     #[test]

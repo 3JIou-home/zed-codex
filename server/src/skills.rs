@@ -20,6 +20,26 @@ pub struct SkillIndexOptions {
     pub max_skill_bytes: usize,
 }
 
+pub fn skill_index_options_signature(options: &SkillIndexOptions) -> String {
+    let roots = options
+        .roots
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\u{0}");
+    blake3::hash(
+        format!(
+            "{}:{}:{}",
+            roots,
+            options.include_globs.join("\u{0}"),
+            options.max_skill_bytes
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
 pub fn build_skill_catalog(options: &SkillIndexOptions) -> Result<SkillCatalog> {
     let include_set = build_include_set(&options.include_globs)?;
     let mut skills = Vec::new();

@@ -13,7 +13,7 @@ pub struct FileRecord {
     pub path: String,
     pub language: String,
     pub size: u64,
-    pub modified_unix: u64,
+    pub modified_unix_nanos: u64,
     pub hash: String,
     pub preview: String,
     pub symbols: Vec<String>,

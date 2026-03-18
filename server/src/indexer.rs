@@ -10,16 +10,23 @@ use chrono::Utc;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 use regex::Regex;
+use tracing::warn;
 
 use crate::{
-    cache::{load_json, save_json, WorkspaceCache},
+    cache::{load_workspace_index, save_workspace_index, WorkspaceCache},
     model::{
         DirectoryCount, FileRecord, LanguageCount, ScanMetrics, SearchHit, WorkspaceIndex,
         WorkspaceOverview,
     },
 };
 
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone)]
+pub struct RefreshedWorkspaceIndex {
+    pub index: WorkspaceIndex,
+    pub generation: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
@@ -28,13 +35,37 @@ pub struct IndexOptions {
     pub ignore_globs: Vec<String>,
 }
 
+pub fn index_options_signature(options: &IndexOptions) -> String {
+    blake3::hash(
+        format!(
+            "{}:{}:{}",
+            options.max_file_bytes,
+            options.max_indexed_files,
+            options.ignore_globs.join("\u{0}")
+        )
+        .as_bytes(),
+    )
+    .to_hex()
+    .to_string()
+}
+
 pub fn refresh_workspace_index(
     workspace_root: &Path,
     cache: &WorkspaceCache,
     options: &IndexOptions,
-) -> Result<WorkspaceIndex> {
-    let previous_index = load_json::<WorkspaceIndex>(&cache.index_file)?
-        .filter(|index| index.format_version == FORMAT_VERSION);
+) -> Result<RefreshedWorkspaceIndex> {
+    let options_signature = index_options_signature(options);
+    let previous_index = match load_workspace_index(cache, &options_signature) {
+        Ok(value) => value.map(|value| value.value),
+        Err(error) => {
+            warn!(
+                "failed to load cached workspace index from {}: {error}",
+                cache.db_path.display()
+            );
+            None
+        }
+    }
+    .filter(|index| index.format_version == FORMAT_VERSION);
     let mut previous_by_path = HashMap::new();
     if let Some(index) = previous_index {
         for file in index.files {
@@ -86,11 +117,11 @@ pub fn refresh_workspace_index(
 
         let metadata = fs::metadata(absolute_path)
             .with_context(|| format!("failed to read metadata for {}", absolute_path.display()))?;
-        let modified_unix = metadata
+        let modified_unix_nanos = metadata
             .modified()
             .ok()
             .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs())
+            .map(|duration| duration.as_nanos() as u64)
             .unwrap_or_default();
 
         if metadata.len() as usize > options.max_file_bytes || metadata.len() == 0 {
@@ -99,7 +130,9 @@ pub fn refresh_workspace_index(
         }
 
         if let Some(previous) = previous_by_path.get(&relative_path) {
-            if previous.size == metadata.len() && previous.modified_unix == modified_unix {
+            if previous.size == metadata.len()
+                && previous.modified_unix_nanos == modified_unix_nanos
+            {
                 total_indexed_bytes += previous.size;
                 scan_metrics.reused_files += 1;
                 files.push(previous.clone());
@@ -119,7 +152,7 @@ pub fn refresh_workspace_index(
             path: relative_path,
             language: detect_language(absolute_path),
             size: metadata.len(),
-            modified_unix,
+            modified_unix_nanos,
             hash: blake3::hash(&bytes).to_hex().to_string(),
             preview: make_preview(&text),
             symbols: extract_symbols(&text),
@@ -145,8 +178,8 @@ pub fn refresh_workspace_index(
         scan_metrics,
     };
 
-    save_json(&cache.index_file, &index)?;
-    Ok(index)
+    let generation = save_workspace_index(cache, &options_signature, &index)?;
+    Ok(RefreshedWorkspaceIndex { index, generation })
 }
 
 pub fn build_workspace_overview(index: &WorkspaceIndex) -> WorkspaceOverview {
@@ -573,7 +606,7 @@ mod tests {
     #[test]
     fn search_workspace_prefers_matching_paths() {
         let index = WorkspaceIndex {
-            format_version: 1,
+            format_version: 2,
             workspace_id: "workspace".to_string(),
             workspace_root: "/tmp/demo".to_string(),
             indexed_at: "2026-03-17T00:00:00Z".to_string(),
@@ -585,7 +618,7 @@ mod tests {
                     path: "src/cache.rs".to_string(),
                     language: "rust".to_string(),
                     size: 50,
-                    modified_unix: 0,
+                    modified_unix_nanos: 0,
                     hash: "a".to_string(),
                     preview: "refresh cache and store index".to_string(),
                     symbols: vec!["refresh_cache".to_string()],
@@ -596,7 +629,7 @@ mod tests {
                     path: "src/main.rs".to_string(),
                     language: "rust".to_string(),
                     size: 50,
-                    modified_unix: 0,
+                    modified_unix_nanos: 0,
                     hash: "b".to_string(),
                     preview: "application entrypoint".to_string(),
                     symbols: vec!["main".to_string()],
@@ -616,7 +649,7 @@ mod tests {
     #[test]
     fn workspace_overview_sorts_languages_by_file_count() {
         let index = WorkspaceIndex {
-            format_version: 1,
+            format_version: 2,
             workspace_id: "workspace".to_string(),
             workspace_root: "/tmp/demo".to_string(),
             indexed_at: "2026-03-17T00:00:00Z".to_string(),
@@ -628,7 +661,7 @@ mod tests {
                     path: "src/lib.rs".to_string(),
                     language: "rust".to_string(),
                     size: 10,
-                    modified_unix: 0,
+                    modified_unix_nanos: 0,
                     hash: "1".to_string(),
                     preview: "rust".to_string(),
                     symbols: Vec::new(),
@@ -639,7 +672,7 @@ mod tests {
                     path: "src/main.rs".to_string(),
                     language: "rust".to_string(),
                     size: 10,
-                    modified_unix: 0,
+                    modified_unix_nanos: 0,
                     hash: "2".to_string(),
                     preview: "rust".to_string(),
                     symbols: Vec::new(),
@@ -650,7 +683,7 @@ mod tests {
                     path: "README.md".to_string(),
                     language: "markdown".to_string(),
                     size: 10,
-                    modified_unix: 0,
+                    modified_unix_nanos: 0,
                     hash: "3".to_string(),
                     preview: "markdown".to_string(),
                     symbols: Vec::new(),
@@ -661,7 +694,7 @@ mod tests {
                     path: "docs/guide.md".to_string(),
                     language: "markdown".to_string(),
                     size: 10,
-                    modified_unix: 0,
+                    modified_unix_nanos: 0,
                     hash: "4".to_string(),
                     preview: "markdown".to_string(),
                     symbols: Vec::new(),
