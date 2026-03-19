@@ -5,28 +5,28 @@ use crate::indexer::IndexOptions;
 const DEFAULT_SKILL_ROOT_CANDIDATES: &[&str] = &[r"D:\downloads\agency-agents"];
 
 #[derive(Debug, Clone)]
-pub(crate) struct ServerConfig {
-    pub(crate) cache_dir_override: Option<PathBuf>,
-    pub(crate) max_file_bytes: usize,
-    pub(crate) max_indexed_files: usize,
-    pub(crate) ignore_globs: Vec<String>,
-    pub(crate) enable_git_tools: bool,
-    pub(crate) refresh_window_secs: u64,
-    pub(crate) git_cache_ttl_secs: u64,
-    pub(crate) bundle_cache_ttl_secs: u64,
-    pub(crate) skill_cache_ttl_secs: u64,
-    pub(crate) prewarm_on_start: bool,
-    pub(crate) execution_mode: String,
-    pub(crate) prefer_full_access: bool,
-    pub(crate) max_parallel_workstreams: usize,
-    pub(crate) skill_roots: Vec<PathBuf>,
-    pub(crate) skill_file_globs: Vec<String>,
-    pub(crate) max_skill_bytes: usize,
-    pub(crate) max_skills_per_query: usize,
+pub struct ServerConfig {
+    pub cache_dir_override: Option<PathBuf>,
+    pub max_file_bytes: usize,
+    pub max_indexed_files: usize,
+    pub ignore_globs: Vec<String>,
+    pub enable_git_tools: bool,
+    pub refresh_window_secs: u64,
+    pub git_cache_ttl_secs: u64,
+    pub bundle_cache_ttl_secs: u64,
+    pub skill_cache_ttl_secs: u64,
+    pub prewarm_on_start: bool,
+    pub execution_mode: String,
+    pub prefer_full_access: bool,
+    pub max_parallel_workstreams: usize,
+    pub skill_roots: Vec<PathBuf>,
+    pub skill_file_globs: Vec<String>,
+    pub max_skill_bytes: usize,
+    pub max_skills_per_query: usize,
 }
 
 impl ServerConfig {
-    pub(crate) fn from_env() -> Self {
+    pub fn from_env() -> Self {
         Self {
             cache_dir_override: std::env::var("CODEX_COMPANION_CACHE_DIR")
                 .ok()

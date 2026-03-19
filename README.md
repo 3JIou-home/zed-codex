@@ -11,6 +11,7 @@ Codex Companion is a Zed extension that augments Zed's built-in Codex support wi
 - task decomposition into scoped workstreams
 - git-aware context tools
 - Zed extension slash commands that reuse the same local cache engine
+- a standalone ACP agent binary for Zed's Agent Panel
 
 It does not replace Zed's native Codex thread support. Instead, it gives Codex a better local MCP server.
 
@@ -44,6 +45,11 @@ Thread history is also owned by Zed's native Agent UI. `codex-companion` cannot 
   - `/codex-plan`
   - `/codex-orchestrate`
   - `/codex-skills`
+- ACP agent binary:
+  - `codex-companion-acp-agent`
+  - default mode: `auto`
+  - advanced modes: `context`, `plan`, `orchestrate`
+  - commands: `/auto`, `/context`, `/plan`, `/orchestrate`, `/skills`, `/memory`, `/status`, `/warm`
 - in Codex ACP threads, call the MCP tools directly instead: `cache_status`, `build_context_bundle`, `orchestrate_task`, `decompose_task`, `search_skills`, `remember_memory`
 
 ## Repo layout
@@ -56,10 +62,16 @@ Thread history is also owned by Zed's native Agent UI. `codex-companion` cannot 
 ## Local setup
 
 1. Install a current Rust toolchain via `rustup`.
-2. Build the companion server:
+2. Build the MCP server:
 
 ```bash
 cargo build --release -p codex-companion-server
+```
+
+3. Build the ACP agent:
+
+```bash
+cargo build --release -p codex-companion-server --bin codex-companion-acp-agent
 ```
 
 If Zed later says it is still waiting for the context service, either set an explicit
@@ -77,13 +89,46 @@ binary path in the `codex-companion` settings:
 }
 ```
 
-or point `release_repo` at a GitHub repository that publishes matching `codex-companion-server-*` release assets. If you also set the same GitHub repository URL in `extension.toml`, the extension can infer `release_repo` automatically. In this repo, treat `release_repo` as the publish-safe default until a real canonical `repository` URL is added to the manifest.
+or point `release_repo` at a GitHub repository that publishes matching `codex-companion-server-*` release assets. If you also set the same GitHub repository URL in `extension.toml`, the extension can infer `release_repo` automatically.
 
-3. In Zed, run `zed: extensions`.
-4. Choose `Install Dev Extension`.
-5. Point Zed to this repository.
-6. Open the Agent Panel settings and enable `codex-companion`.
-7. Start a new Codex thread and keep the companion server enabled for that profile.
+4. In Zed, run `zed: extensions`.
+5. Choose `Install Dev Extension`.
+6. Point Zed to this repository.
+7. Open the Agent Panel settings and enable `codex-companion`.
+8. Start a new Codex thread and keep the companion server enabled for that profile.
+
+To add the ACP agent directly to Zed's Agent Panel during development, register the built binary under `agent_servers`:
+
+```json
+{
+  "agent_servers": {
+    "Codex Companion": {
+      "type": "custom",
+      "command": "D:\\downloads\\zed-codex\\target\\release\\codex-companion-acp-agent.exe",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+This ACP agent now prepares local companion context, then hands the turn to an upstream Codex ACP
+backend so it behaves like the installed Codex agent inside Zed. It tries the following backend
+sources in order:
+
+1. `CODEX_COMPANION_CODEX_ACP_BIN`
+2. `CODEX_COMPANION_CODEX_BIN` as a legacy compatibility alias
+3. `codex-acp` on `PATH`
+4. the Codex ACP binary installed under `%LOCALAPPDATA%\\Zed\\external_agents\\registry\\codex-acp`
+
+If no Codex backend is available, or the handoff fails, the agent falls back to the local deterministic companion output instead of crashing.
+
+Useful ACP env overrides:
+
+- `CODEX_COMPANION_CODEX_ACP_BIN`: explicit path to a `codex-acp` binary/command
+- `CODEX_COMPANION_CODEX_BIN`: legacy alias for the same override
+- `CODEX_COMPANION_CODEX_MAX_CONTEXT_CHARS`: cap the companion packet sent into each Codex turn
+- `CODEX_COMPANION_CODEX_MAX_FILE_EXCERPT_CHARS`: cap per-file excerpts included in that packet
 
 If Zed shows a `default_settings.jsonc` preview for the context server, treat it as reference text only. Change real values in the agent settings UI or `.zed/settings.jsonc`.
 
@@ -176,3 +221,10 @@ The included release workflow builds server archives for:
 - macOS aarch64
 
 Any other platform can still build from source with the same `cargo build --release -p codex-companion-server` command.
+
+## ACP agent notes
+
+The new ACP binary is intended for direct use from Zed's external-agent support. Zed's official docs describe custom ACP agents under `agent_servers` and note that, starting with `v0.221.x`, the ACP Registry is the preferred distribution path for third-party agents. During local development, a `type = "custom"` entry is the simplest way to run this repo's ACP agent. See the official docs:
+
+- Zed external agents: https://zed.dev/docs/ai/external-agents
+- Zed agent server extensions: https://zed.dev/docs/extensions/agent-servers

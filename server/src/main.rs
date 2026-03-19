@@ -1,21 +1,14 @@
-mod cache;
-mod config;
-mod formatting;
-mod git_tools;
-mod indexer;
-mod model;
-mod planning;
-mod skills;
-mod state;
-mod text;
+use std::{path::PathBuf, sync::Arc};
 
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
+use codex_companion_server::{
+    build_workspace_overview, format_cache_status, format_context_bundle, format_memory_results,
+    format_skill_results, format_task_decomposition, format_task_orchestration,
+    format_warmup_status, init_tracing, normalize_tags, resolve_root, AppState, CacheStatus,
+    ContextBundle, GitSummary, MemoryRecord, MemorySearchResults, SearchResults, ServerConfig,
+    SkillSearchResults, TaskDecomposition, TaskOrchestration, WarmupStatus, WorkspaceOverview,
+};
 use rmcp::{
     handler::server::{
         router::{prompt::PromptRouter, tool::ToolRouter, Router},
@@ -28,21 +21,6 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracing_subscriber::EnvFilter;
-
-use crate::{
-    config::ServerConfig,
-    formatting::{
-        format_cache_status, format_context_bundle, format_memory_results, format_skill_results,
-        format_task_decomposition, format_task_orchestration, format_warmup_status,
-    },
-    indexer::build_workspace_overview,
-    model::{
-        CacheStatus, ContextBundle, GitSummary, MemoryRecord, MemorySearchResults, SearchResults,
-        SkillSearchResults, TaskDecomposition, TaskOrchestration, WarmupStatus, WorkspaceOverview,
-    },
-    state::AppState,
-};
 
 #[derive(Clone)]
 struct CodexCompanionServer {
@@ -254,7 +232,8 @@ impl CodexCompanionServer {
         self.state
             .search_skills(
                 args.query,
-                args.limit.unwrap_or(self.state.config.max_skills_per_query),
+                args.limit
+                    .unwrap_or(self.state.config().max_skills_per_query),
                 args.force_refresh.unwrap_or(false),
             )
             .await
@@ -270,7 +249,7 @@ impl CodexCompanionServer {
         &self,
         Parameters(args): Parameters<RememberMemoryArgs>,
     ) -> Result<Json<MemoryRecord>, String> {
-        let tags = normalize_tags(args.tags.unwrap_or_default(), &self.state.root);
+        let tags = normalize_tags(args.tags.unwrap_or_default(), self.state.root());
         let importance = args.importance.unwrap_or_else(|| "normal".to_string());
         self.state
             .remember(args.title, args.content, tags, importance)
@@ -394,8 +373,8 @@ impl CodexCompanionServer {
         let focus = args
             .focus
             .unwrap_or_else(|| "correctness, context gathering, and safe execution".to_string());
-        let execution_mode = self.state.config.execution_mode.clone();
-        let access_hint = if self.state.config.prefer_full_access {
+        let execution_mode = self.state.config().execution_mode.clone();
+        let access_hint = if self.state.config().prefer_full_access {
             "If the host offers a full-access or auto-approved mode for trusted workspaces, enable it after the initial read-only scan so implementation turns are not bottlenecked by confirmations."
         } else {
             "Stay in the host's normal approval mode unless the task clearly needs stronger access."
@@ -623,7 +602,7 @@ async fn main() -> Result<()> {
 
 async fn serve_stdio(root: PathBuf, config: ServerConfig) -> Result<()> {
     let state = AppState::new(root, config)?;
-    if state.config.prewarm_on_start {
+    if state.should_prewarm_on_start() {
         let warm_state = state.clone();
         tokio::spawn(async move {
             let _ = warm_state.warmup(false).await;
@@ -643,50 +622,3 @@ async fn serve_stdio(root: PathBuf, config: ServerConfig) -> Result<()> {
     service.waiting().await?;
     Ok(())
 }
-
-fn resolve_root(root: Option<PathBuf>) -> Result<PathBuf> {
-    let root = match root {
-        Some(path) => path,
-        None => {
-            std::env::current_dir().context("failed to determine the current working directory")?
-        }
-    };
-
-    if !root.exists() {
-        return Err(anyhow!("workspace root does not exist: {}", root.display()));
-    }
-    if !root.is_dir() {
-        return Err(anyhow!(
-            "workspace root is not a directory: {}",
-            root.display()
-        ));
-    }
-    Ok(root)
-}
-
-fn normalize_tags(tags: Vec<String>, root: &Path) -> Vec<String> {
-    let mut normalized = tags
-        .into_iter()
-        .map(|tag| tag.trim().to_lowercase())
-        .filter(|tag| !tag.is_empty())
-        .collect::<Vec<_>>();
-
-    if let Some(name) = root.file_name().and_then(|value| value.to_str()) {
-        normalized.push(name.to_lowercase());
-    }
-    normalized.push("codex-companion".to_string());
-    normalized.sort();
-    normalized.dedup();
-    normalized
-}
-
-fn init_tracing() {
-    let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
-        .try_init();
-}
-
-#[cfg(test)]
-mod tests;

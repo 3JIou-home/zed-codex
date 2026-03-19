@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -70,7 +70,7 @@ pub(crate) struct RuntimeState {
 }
 
 #[derive(Clone)]
-pub(crate) struct AppState {
+pub struct AppState {
     pub(crate) root: PathBuf,
     pub(crate) cache: WorkspaceCache,
     pub(crate) config: ServerConfig,
@@ -82,7 +82,7 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn new(root: PathBuf, config: ServerConfig) -> Result<Self> {
+    pub fn new(root: PathBuf, config: ServerConfig) -> Result<Self> {
         let cache = resolve_workspace_cache(&root, config.cache_dir_override.as_ref())?;
         let persistent_generations = load_persistent_generations(&cache).unwrap_or_else(|error| {
             warn!(
@@ -135,7 +135,7 @@ impl AppState {
         }
     }
 
-    pub(crate) async fn ensure_index(&self, force_refresh: bool) -> Result<Arc<WorkspaceIndex>> {
+    pub async fn ensure_index(&self, force_refresh: bool) -> Result<Arc<WorkspaceIndex>> {
         if !force_refresh {
             let persistent_generations = self.persistent_generations_snapshot().await;
             let runtime = self.runtime.lock().await;
@@ -218,7 +218,7 @@ impl AppState {
         Ok(refreshed)
     }
 
-    pub(crate) async fn cache_status(&self, force_refresh: bool) -> Result<CacheStatus> {
+    pub async fn cache_status(&self, force_refresh: bool) -> Result<CacheStatus> {
         let index = self.ensure_index(force_refresh).await?;
         Ok(CacheStatus {
             workspace_id: self.cache.workspace_id.clone(),
@@ -231,7 +231,7 @@ impl AppState {
         })
     }
 
-    pub(crate) fn search_workspace_hits(
+    pub fn search_workspace_hits(
         &self,
         index: &WorkspaceIndex,
         query: &str,
@@ -246,7 +246,7 @@ impl AppState {
         )
     }
 
-    pub(crate) async fn load_memories(&self) -> Result<MemoryStore> {
+    pub async fn load_memories(&self) -> Result<MemoryStore> {
         {
             let persistent_generations = self.persistent_generations_snapshot().await;
             let runtime = self.runtime.lock().await;
@@ -404,7 +404,7 @@ impl AppState {
         Ok(Some(catalog))
     }
 
-    pub(crate) async fn search_skills(
+    pub async fn search_skills(
         &self,
         query: Option<String>,
         limit: usize,
@@ -422,7 +422,7 @@ impl AppState {
         Ok(search_skills(&catalog, query.as_deref(), limit))
     }
 
-    pub(crate) async fn warmup(&self, force_refresh: bool) -> Result<WarmupStatus> {
+    pub async fn warmup(&self, force_refresh: bool) -> Result<WarmupStatus> {
         let started_at = Instant::now();
         let cache_status = self.cache_status(force_refresh).await?;
         let warmed_git = matches!(
@@ -442,7 +442,7 @@ impl AppState {
         })
     }
 
-    pub(crate) async fn remember(
+    pub async fn remember(
         &self,
         title: String,
         content: String,
@@ -498,7 +498,7 @@ impl AppState {
         Ok(memory)
     }
 
-    pub(crate) async fn recall(
+    pub async fn recall(
         &self,
         query: Option<String>,
         tags: Vec<String>,
@@ -553,7 +553,7 @@ impl AppState {
             .collect())
     }
 
-    pub(crate) async fn git_summary(
+    pub async fn git_summary(
         &self,
         limit_commits: usize,
         include_diffstat: bool,
@@ -616,7 +616,7 @@ impl AppState {
         Some(summary)
     }
 
-    pub(crate) async fn build_context_bundle(
+    pub async fn build_context_bundle(
         &self,
         task: String,
         limit: usize,
@@ -707,7 +707,7 @@ impl AppState {
         Ok(bundle)
     }
 
-    pub(crate) async fn decompose_task(
+    pub async fn decompose_task(
         &self,
         task: String,
         limit: usize,
@@ -747,7 +747,7 @@ impl AppState {
         Ok(decomposition)
     }
 
-    pub(crate) async fn orchestrate_task(
+    pub async fn orchestrate_task(
         &self,
         task: String,
         limit: usize,
@@ -804,6 +804,18 @@ impl AppState {
                 versions,
             },
         );
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
+    pub fn should_prewarm_on_start(&self) -> bool {
+        self.config.prewarm_on_start
     }
 }
 

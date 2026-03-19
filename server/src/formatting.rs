@@ -3,7 +3,7 @@ use crate::model::{
     TaskOrchestration, WarmupStatus,
 };
 
-pub(crate) fn format_cache_status(status: &CacheStatus) -> String {
+pub fn format_cache_status(status: &CacheStatus) -> String {
     format!(
         "# Codex Companion Cache\n\n\
 Workspace: `{}`\n\
@@ -27,7 +27,7 @@ Indexed at: `{}`\n\n\
     )
 }
 
-pub(crate) fn format_warmup_status(status: &WarmupStatus) -> String {
+pub fn format_warmup_status(status: &WarmupStatus) -> String {
     format!(
         "# Codex Companion Warmup\n\n\
 Workspace: `{}`\n\
@@ -44,7 +44,7 @@ Skills warmed: {}\n\n{}",
     )
 }
 
-pub(crate) fn format_context_bundle(bundle: &ContextBundle) -> String {
+pub fn format_context_bundle(bundle: &ContextBundle) -> String {
     let mut output = String::new();
     output.push_str("# Codex Context Bundle\n\n");
     output.push_str(&format!("Task: {}\n\n", bundle.task));
@@ -121,7 +121,7 @@ pub(crate) fn format_context_bundle(bundle: &ContextBundle) -> String {
     output
 }
 
-pub(crate) fn format_task_orchestration(orchestration: &TaskOrchestration) -> String {
+pub fn format_task_orchestration(orchestration: &TaskOrchestration) -> String {
     let mut output = String::new();
     output.push_str("# Codex Task Orchestration\n\n");
     output.push_str(&format!("Task: {}\n", orchestration.task));
@@ -213,7 +213,7 @@ pub(crate) fn format_task_orchestration(orchestration: &TaskOrchestration) -> St
     output
 }
 
-pub(crate) fn format_task_decomposition(decomposition: &TaskDecomposition) -> String {
+pub fn format_task_decomposition(decomposition: &TaskDecomposition) -> String {
     let mut output = String::new();
     output.push_str("# Codex Task Decomposition\n\n");
     output.push_str(&format!("Task: {}\n", decomposition.task));
@@ -293,7 +293,7 @@ pub(crate) fn format_task_decomposition(decomposition: &TaskDecomposition) -> St
     output
 }
 
-pub(crate) fn format_memory_results(results: &MemorySearchResults) -> String {
+pub fn format_memory_results(results: &MemorySearchResults) -> String {
     let mut output = String::new();
     output.push_str("# Codex Memory Recall\n\n");
     if let Some(query) = &results.query {
@@ -319,7 +319,7 @@ pub(crate) fn format_memory_results(results: &MemorySearchResults) -> String {
     output
 }
 
-pub(crate) fn format_skill_results(results: &SkillSearchResults) -> String {
+pub fn format_skill_results(results: &SkillSearchResults) -> String {
     let mut output = String::new();
     output.push_str("# Codex Skills\n\n");
     if let Some(query) = &results.query {
